@@ -1,0 +1,8 @@
+build/
+*.keystore
+*.jks
+fdroid/config.yml
+fdroid/keystore.p12
+fdroid/tmp/
+fdroid/archive/
+fdroid/unsigned/

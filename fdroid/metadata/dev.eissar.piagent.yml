@@ -1,0 +1,15 @@
+Categories:
+  - Development
+License: MIT
+SourceCode: https://github.com/eissar/vibe-pi-android
+IssueTracker: https://github.com/eissar/vibe-pi-android/issues
+AutoName: Pi Agent
+Summary: Native client for pi-agent-webui
+Description: |-
+  Pi Agent is a native Android client for the pi-agent-webui server.
+  It is written entirely in Odin (no Java/Kotlin), renders its own UI
+  with OpenGL ES and talks to the server's WebSocket RPC endpoint.
+
+  Point it at your server (LAN or VPN, ws:// only) to browse sessions,
+  start new ones, and chat with the Pi coding agent with live streaming,
+  tool-call cards and model selection.
