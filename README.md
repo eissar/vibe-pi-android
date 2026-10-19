@@ -43,3 +43,4 @@ tools/deps.sh         # once: fetch + cross-compile SDL3, SDL3_ttf, Clay; build 
 Source: `src/main.odin` (SDL loop + Clay renderer), `ui.odin` (input, widgets, icons, text fields),
 `screens.odin` (all screens), `net.odin` (WebSocket), `rpc.odin`/`app.odin` (protocol + state),
 `src/clay/` (Clay's Odin bindings).
+[ "$(git config core.hooksPath)" = tools/githooks ] && echo ok
