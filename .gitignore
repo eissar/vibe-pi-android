@@ -6,3 +6,4 @@ fdroid/keystore.p12
 fdroid/tmp/
 fdroid/archive/
 fdroid/unsigned/
+third_party/

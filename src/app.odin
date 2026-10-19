@@ -6,6 +6,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:slice"
+import sdl "vendor:sdl3"
 import "core:strings"
 
 Screen :: enum {
@@ -50,12 +51,10 @@ Chat :: struct {
 	results:       map[string]^Message, // tool call id -> toolResult message
 	running_tools: map[string]bool,
 	composer:      Text_Field,
-	scroll:        Scroll,
 	stick_bottom:  bool,
 	pending_prompt: string,
 	provider:      string,
 	model_id:      string,
-	layout_w:      f32,
 }
 
 App :: struct {
@@ -74,15 +73,12 @@ App :: struct {
 	sessions_loading: bool,
 	sessions_dirty_at: f64,
 	running_ids:     map[string]bool,
-	sessions_scroll: Scroll,
 	recent_cwds:     [dynamic]string,
 	default_cwd:     string,
 	models:          [dynamic]Model_Item,
 	models_arena:    virtual.Arena,
 	default_model:   Model_Item,
 	model_picker:    bool,
-	model_scroll:    Scroll,
-	new_scroll:      Scroll,
 	chat:            Chat,
 	expanded:        map[string]bool,
 	toast_text:      string,
@@ -124,6 +120,10 @@ settings_path :: proc() -> string {
 	return concat(plat.data_dir, "/settings.txt")
 }
 
+concat :: proc(a, b: string, allocator := context.temp_allocator) -> string {
+	return strings.concatenate({a, b}, allocator)
+}
+
 app_load_settings :: proc() {
 	data, ok := read_file(settings_path(), context.temp_allocator)
 	if !ok do return
@@ -156,7 +156,6 @@ toast :: proc(msg: string) {
 	delete(app.toast_text)
 	app.toast_text = strings.clone(msg)
 	app.toast_until = now_ms() + 3200
-	request_redraw(3300)
 }
 
 // --- connection -------------------------------------------------------------------
@@ -208,7 +207,6 @@ app_on_disconnected :: proc() {
 	if app.connect_wanted {
 		app.reconnect_delay = clamp(app.reconnect_delay * 2, 1000, 15000)
 		app.reconnect_at = now_ms() + app.reconnect_delay
-		request_redraw(app.reconnect_delay + 10)
 	}
 	if !app.ever_connected && len(conn.error) > 0 && app.screen == .Connect {
 		// first attempt failed: stay on the connect screen without retry loop
@@ -397,7 +395,6 @@ on_event :: proc(topic, key: string, data: json.Value) {
 		}
 	case "sessions.changed":
 		if app.sessions_dirty_at == 0 do app.sessions_dirty_at = now_ms() + 600
-		request_redraw(650)
 	}
 }
 
@@ -416,7 +413,6 @@ chat_index_message :: proc(m: ^Message) {
 	for b in m.blocks do if b.kind == .Tool_Call && len(b.call_id) > 0 do app.chat.calls[b.call_id] = m
 	if m.role == .Tool_Result && len(m.tool_call_id) > 0 {
 		app.chat.results[m.tool_call_id] = m
-		if owner, ok := app.chat.calls[m.tool_call_id]; ok do owner.dirty = true
 	}
 }
 
@@ -435,7 +431,6 @@ chat_set_messages :: proc(arr: json.Array) {
 		append(&app.chat.messages, m)
 		chat_index_message(m)
 	}
-	for m in app.chat.messages do m.dirty = true
 }
 
 chat_append :: proc(m: ^Message) {
@@ -484,7 +479,6 @@ open_session :: proc(s: Session_Item) {
 	app.chat.is_new = false
 	app.chat.running = app.running_ids[s.id]
 	app.chat.phase = app.chat.running ? "Working…" : ""
-	app.chat.scroll = {}
 	app.chat.stick_bottom = true
 	chat_set_model("", "")
 	app.screen = .Chat
@@ -512,7 +506,6 @@ start_new_session :: proc(cwd: string) {
 	app.chat.is_new = true
 	app.chat.running = false
 	app.chat.phase = ""
-	app.chat.scroll = {}
 	app.chat.stick_bottom = true
 	chat_set_model(app.default_model.provider, app.default_model.id)
 	app.screen = .Chat
@@ -544,7 +537,6 @@ chat_send :: proc() {
 	msg_uid_counter += 1
 	m.uid = msg_uid_counter
 	m.role = .User
-	m.dirty = true
 	owned := strings.clone(text)
 	append(&m.strs, owned)
 	append(&m.blocks, Block{kind = .Text, text = owned})
@@ -645,7 +637,6 @@ chat_on_agent_event :: proc(ev: json.Value) {
 		id := jstr(jget(ev, "toolCallId"))
 		if len(id) > 0 {
 			c.running_tools[strings.clone(id)] = true
-			if owner, ok := c.calls[id]; ok do owner.dirty = true
 		}
 		c.phase = strings.clone(fmt.tprintf("Running %s…", jstr(jget(ev, "toolName"))))
 		phase_own(c.phase)
@@ -658,7 +649,6 @@ chat_on_agent_event :: proc(ev: json.Value) {
 				break
 			}
 		}
-		if owner, ok := c.calls[id]; ok do owner.dirty = true
 		c.phase = "Working…"
 	case "prompt_done":
 		c.running = false
@@ -743,7 +733,7 @@ dialog_respond :: proc(value: string, confirmed: bool, cancelled: bool) {
 
 app_can_go_back :: proc() -> bool {
 	if app.dialog.active || app.model_picker do return true
-	return app.screen == .Chat || app.screen == .New_Session
+	return app.screen == .Chat || app.screen == .New_Session || (app.screen == .Connect && conn.state == .Open)
 }
 
 app_back :: proc() -> bool {
@@ -754,6 +744,10 @@ app_back :: proc() -> bool {
 	if app.model_picker {
 		app.model_picker = false
 		tf_blur()
+		return true
+	}
+	if app.screen == .Connect && conn.state == .Open {
+		app.screen = .Sessions
 		return true
 	}
 	switch app.screen {
@@ -807,9 +801,9 @@ parse_iso_time :: proc(s: string) -> f64 {
 }
 
 unix_now :: proc() -> f64 {
-	ts: timespec
-	clock_gettime(0, &ts) // CLOCK_REALTIME
-	return f64(ts.tv_sec)
+	t: sdl.Time
+	_ = sdl.GetCurrentTime(&t)
+	return f64(t) / 1e9
 }
 
 relative_time :: proc(t: f64) -> string {

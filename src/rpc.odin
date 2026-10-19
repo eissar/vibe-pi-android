@@ -244,12 +244,20 @@ Message :: struct {
 	is_error:     bool,
 	label:        string, // for custom/other roles
 	strs:         [dynamic]string, // owned allocations
-	// layout cache
-	dirty:        bool,
-	layout_w:     f32,
-	height:       f32,
-	items:        [dynamic]Item,
-	layout_strs:  [dynamic]string,
+	parts:        [dynamic]Part,   // markdown split of text blocks (lazy)
+	parsed:       bool,
+}
+
+Part_Kind :: enum {
+	Para,
+	Code,
+	Heading,
+}
+
+Part :: struct {
+	kind:  Part_Kind,
+	text:  string, // slice of a block's text (or owned when rewritten)
+	block: int,
 }
 
 msg_uid_counter: int
@@ -267,9 +275,7 @@ message_free :: proc(m: ^Message) {
 	for s in m.strs do delete(s)
 	delete(m.strs)
 	delete(m.blocks)
-	layout_clear(m)
-	delete(m.items)
-	delete(m.layout_strs)
+	delete(m.parts)
 	free(m)
 }
 
@@ -313,7 +319,6 @@ message_from_json :: proc(v: json.Value) -> ^Message {
 	m := new(Message)
 	msg_uid_counter += 1
 	m.uid = msg_uid_counter
-	m.dirty = true
 	switch role {
 	case "user":
 		m.role = .User

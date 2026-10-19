@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the Pi Agent Android app: Odin -> libmain.so (per ABI) -> signed APK.
-# No Java/Kotlin sources and no Gradle: NativeActivity loads libmain.so directly.
+# Native deps (SDL3, SDL3_ttf, Clay) and SDL's Java glue come from tools/deps.sh.
+# No Gradle.
 #
 # Usage: ./build.sh [arm64|x86_64|all]   (default: all)
 #        ./build.sh install               (build all + adb install)
@@ -23,6 +24,8 @@ install=0
 if [[ "$what" == "install" ]]; then install=1; what=all; fi
 
 export ODIN_ANDROID_NDK="$NDK/"
+DEPS=build/deps
+[[ -f $DEPS/classes.dex ]] || tools/deps.sh
 
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
 
@@ -37,10 +40,11 @@ build_abi() {
     -minimum-os-version:$API -o:speed -use-single-module \
     -out:"$OUT/obj/libmain-$abi.o"
   "$TOOLCHAIN/bin/clang" --target="$triple$API" -shared -o "$OUT/apk/lib/$abi/libmain.so" \
-    "$OUT/obj/libmain-$abi.o" \
+    "$OUT/obj/libmain-$abi.o" -L"$DEPS/$abi" -lclay -lSDL3 -lSDL3_ttf \
     -Wl,-init,_odin_entry_point -Wl,-fini,_odin_exit_point \
     -Wl,-z,max-page-size=16384 -Wl,--no-undefined -Wl,--gc-sections -s \
-    -landroid -llog -lEGL -lGLESv2 -lm -lc
+    -landroid -llog -lm -lc
+  for so in "$DEPS/$abi"/*.so; do "$TOOLCHAIN/bin/llvm-strip" --strip-unneeded -o "$OUT/apk/lib/$abi/$(basename "$so")" "$so"; done
 }
 
 rm -rf "$OUT/apk"
@@ -59,6 +63,7 @@ fi
 
 echo "==> package"
 rm -f "$OUT/unsigned.apk" "$OUT/aligned.apk" "$APK"
+cp "$DEPS/classes.dex" "$OUT/apk/"
 "$BT/aapt" package -f -M AndroidManifest.xml -I "$PLATFORM" -F "$OUT/unsigned.apk" "$OUT/apk"
 "$BT/zipalign" -f -p 16 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \

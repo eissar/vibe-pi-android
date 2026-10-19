@@ -1,439 +1,390 @@
 package main
 
-// NativeActivity entry point and platform loop, written directly in Odin.
-// Everything runs on the activity's main thread: the main ALooper delivers
-// input events, socket readiness and a timerfd that drives redraws.
+// SDL3 platform layer + Clay renderer. SDL's SDLActivity (Java, shipped by
+// SDL) loads libmain.so and calls SDL_main on its own thread.
 
 import "base:runtime"
 import "core:c"
 import "core:math"
+import "core:strings"
+import clay "clay"
+import sdl "vendor:sdl3"
+import ttf "vendor:sdl3/ttf"
 
 Platform :: struct {
-	activity:   ^ANativeActivity,
-	looper:     rawptr,
-	window:     rawptr,
-	queue:      rawptr,
-	gfx:        Gfx,
-	timer_fd:   c.int,
-	timer_due:  f64, // ms timestamp the timer is armed for (0 = disarmed)
-	content:    ARect,
-	have_content: bool,
-	density:    f32,
-	resumed:    bool,
-	data_dir:   string,
-	gl_ready:   bool,
+	window:   ^sdl.Window,
+	renderer: ^sdl.Renderer,
+	engine:   ^ttf.TextEngine,
+	data_dir: string,
+	w, h:     f32,
+	dirty:    bool,
+	active_until: f64, // keep rendering until this time (scroll momentum etc.)
 }
 
 plat: Platform
-rend: Renderer
-g_ctx: runtime.Context
-fonts_loaded: bool
 
-@(export)
-ANativeActivity_onCreate :: proc "c" (activity: ^ANativeActivity, saved_state: rawptr, saved_size: c.size_t) {
-	context = runtime.default_context()
-	g_ctx = context
+FONT_SANS :: 0
+FONT_MONO :: 1
+FONT_BOLD :: 2
+FONT_PATHS := [3][]cstring {
+	{"/system/fonts/Roboto-Regular.ttf", "/system/fonts/DroidSans.ttf"},
+	{"/system/fonts/DroidSansMono.ttf", "/system/fonts/CutiveMono.ttf"},
+	{"/system/fonts/Roboto-Bold.ttf", "/system/fonts/Roboto-Medium.ttf", "/system/fonts/Roboto-Regular.ttf"},
+}
+FALLBACK_FONTS := []cstring{"/system/fonts/NotoColorEmoji.ttf", "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf", "/system/fonts/NotoSansCJK-Regular.ttc"}
 
-	plat.activity = activity
-	plat.looper = ALooper_forThread()
-	plat.data_dir = string(activity.internalDataPath)
+fonts: map[[2]int]^ttf.Font
+fallbacks: [dynamic]^ttf.Font
 
-	cb := activity.callbacks
-	cb.onStart = on_start
-	cb.onResume = on_resume
-	cb.onPause = on_pause
-	cb.onStop = on_stop
-	cb.onDestroy = on_destroy
-	cb.onWindowFocusChanged = on_focus
-	cb.onNativeWindowCreated = on_window_created
-	cb.onNativeWindowResized = on_window_resized
-	cb.onNativeWindowRedrawNeeded = on_window_redraw
-	cb.onNativeWindowDestroyed = on_window_destroyed
-	cb.onInputQueueCreated = on_input_created
-	cb.onInputQueueDestroyed = on_input_destroyed
-	cb.onContentRectChanged = on_content_rect
-	cb.onConfigurationChanged = on_config_changed
-	cb.onLowMemory = nil
-	cb.onSaveInstanceState = nil
-
-	update_density()
-
-	if !fonts_loaded {
-		load_fonts()
-		atlas_init_cpu()
-		fonts_loaded = true
+get_font :: proc(id: int, size: int) -> ^ttf.Font {
+	key := [2]int{id, size}
+	if f, ok := fonts[key]; ok do return f
+	f: ^ttf.Font
+	for p in FONT_PATHS[id] {
+		f = ttf.OpenFont(p, f32(size))
+		if f != nil do break
 	}
-
-	plat.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)
-	plat.timer_due = 0
-	ALooper_addFd(plat.looper, plat.timer_fd, -2, ALOOPER_EVENT_INPUT, on_timer, nil)
-
-	app_init()
-	log_info("Pi Agent started")
-}
-
-update_density :: proc() {
-	cfg := AConfiguration_new()
-	AConfiguration_fromAssetManager(cfg, plat.activity.assetManager)
-	dpi := AConfiguration_getDensity(cfg)
-	AConfiguration_delete(cfg)
-	if dpi <= 0 || dpi == 0xffff do dpi = 160
-	plat.density = f32(dpi) / 160
-	ui.dp = plat.density
-}
-
-load_fonts :: proc() {
-	try :: proc(id: int, paths: []string) {
-		for p in paths {
-			data, ok := read_file(p)
-			if !ok do continue
-			if font_load(&fonts[id], data) {
-				log_info(concat("font: ", p))
-				return
+	if f != nil {
+		for p in FALLBACK_FONTS {
+			fb := ttf.OpenFont(p, f32(size))
+			if fb != nil {
+				ttf.AddFallbackFont(f, fb)
+				append(&fallbacks, fb)
 			}
-			delete(data)
 		}
 	}
-	try(FONT_SANS, {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSans-Regular.ttf"})
-	try(FONT_MONO, {"/system/fonts/DroidSansMono.ttf", "/system/fonts/CutiveMono.ttf", "/system/fonts/RobotoMono-Regular.ttf"})
-	try(FONT_BOLD, {"/system/fonts/Roboto-Bold.ttf", "/system/fonts/DroidSans-Bold.ttf", "/system/fonts/Roboto-Medium.ttf"})
-	if !fonts[FONT_BOLD].ok do fonts[FONT_BOLD] = fonts[FONT_SANS]
+	fonts[key] = f
+	return f
 }
 
-read_file :: proc(path: string, allocator := context.allocator) -> ([]u8, bool) {
-	cpath := make([]u8, len(path) + 1, context.temp_allocator)
-	copy(cpath, path)
-	fd := open(cstring(raw_data(cpath)), O_RDONLY | O_CLOEXEC)
-	if fd < 0 do return nil, false
-	defer close(fd)
-	out := make([dynamic]u8, 0, 64 * 1024, allocator)
-	buf: [16384]u8
-	for {
-		n := read(fd, &buf[0], len(buf))
-		if n < 0 && errno() == EINTR do continue
-		if n <= 0 do break
-		append(&out, ..buf[:n])
+measure_text :: proc "c" (text: clay.StringSlice, config: ^clay.TextElementConfig, _: rawptr) -> clay.Dimensions {
+	context = g_ctx
+	f := get_font(int(config.fontId), int(config.fontSize))
+	if f == nil do return {}
+	w, h: c.int
+	if text.length > 0 do ttf.GetStringSize(f, cstring(text.chars), c.size_t(text.length), &w, &h)
+	else do h = ttf.GetFontHeight(f)
+	return {f32(w), f32(h)}
+}
+
+// Cache of shaped TTF_Text objects, evicted when unused for a frame.
+Text_Key :: struct {
+	s:    string,
+	font: [2]int,
+}
+Text_Entry :: struct {
+	text:  ^ttf.Text,
+	frame: int,
+}
+text_cache: map[Text_Key]Text_Entry
+frame_no: int
+
+draw_text_cmd :: proc(r: clay.BoundingBox, t: clay.TextRenderData) {
+	s := string(t.stringContents.chars[:t.stringContents.length])
+	key := Text_Key{s, {int(t.fontId), int(t.fontSize)}}
+	e, ok := text_cache[key]
+	if !ok {
+		f := get_font(key.font[0], key.font[1])
+		if f == nil do return
+		key.s = strings.clone(s)
+		e.text = ttf.CreateText(plat.engine, f, cstring(raw_data(key.s)), c.size_t(len(key.s)))
 	}
-	return out[:], true
+	e.frame = frame_no
+	text_cache[key] = e
+	col := t.textColor
+	ttf.SetTextColor(e.text, u8(col.r), u8(col.g), u8(col.b), u8(col.a))
+	ttf.DrawRendererText(e.text, r.x, r.y)
+}
+
+evict_text_cache :: proc() {
+	stale := make([dynamic]Text_Key, 0, 64, context.temp_allocator)
+	for k, e in text_cache do if e.frame < frame_no - 1 do append(&stale, k)
+	for k in stale {
+		ttf.DestroyText(text_cache[k].text)
+		delete_key(&text_cache, k)
+		delete(k.s)
+	}
+}
+
+// --- geometry ---------------------------------------------------------------
+
+verts: [dynamic]sdl.Vertex
+idx: [dynamic]c.int
+
+fcol :: proc(c: clay.Color) -> sdl.FColor {return {c.r / 255, c.g / 255, c.b / 255, c.a / 255}}
+
+tri :: proc(a, b, cc: [2]f32, col: clay.Color) {
+	fc := fcol(col)
+	base := c.int(len(verts))
+	append(&verts, sdl.Vertex{position = sdl.FPoint(a), color = fc}, sdl.Vertex{position = sdl.FPoint(b), color = fc}, sdl.Vertex{position = sdl.FPoint(cc), color = fc})
+	append(&idx, base, base + 1, base + 2)
+}
+
+fill_rect :: proc(x, y, w, h: f32, col: clay.Color) {
+	tri({x, y}, {x + w, y}, {x + w, y + h}, col)
+	tri({x, y}, {x + w, y + h}, {x, y + h}, col)
+}
+
+fill_rrect :: proc(r: clay.BoundingBox, radius: f32, col: clay.Color) {
+	rad := min(radius, r.width / 2, r.height / 2)
+	if rad < 1 {
+		fill_rect(r.x, r.y, r.width, r.height, col)
+		return
+	}
+	fill_rect(r.x + rad, r.y, r.width - 2 * rad, r.height, col)
+	fill_rect(r.x, r.y + rad, rad, r.height - 2 * rad, col)
+	fill_rect(r.x + r.width - rad, r.y + rad, rad, r.height - 2 * rad, col)
+	N :: 8
+	centers := [4][2]f32{{r.x + rad, r.y + rad}, {r.x + r.width - rad, r.y + rad}, {r.x + r.width - rad, r.y + r.height - rad}, {r.x + rad, r.y + r.height - rad}}
+	for cpt, q in centers {
+		a0 := math.PI + f32(q) * math.PI / 2
+		for i in 0 ..< N {
+			a := a0 + f32(i) / N * math.PI / 2
+			b := a0 + f32(i + 1) / N * math.PI / 2
+			tri(cpt, cpt + {math.cos(a), math.sin(a)} * rad, cpt + {math.cos(b), math.sin(b)} * rad, col)
+		}
+	}
+}
+
+seg :: proc(a, b: [2]f32, thick: f32, col: clay.Color) {
+	d := b - a
+	l := math.sqrt(d.x * d.x + d.y * d.y)
+	if l < 0.001 do return
+	n := [2]f32{-d.y, d.x} / l * (thick / 2)
+	tri(a + n, b + n, b - n, col)
+	tri(a + n, b - n, a - n, col)
+}
+
+flush_geometry :: proc() {
+	if len(idx) == 0 do return
+	sdl.RenderGeometry(plat.renderer, nil, raw_data(verts), c.int(len(verts)), raw_data(idx), c.int(len(idx)))
+	clear(&verts)
+	clear(&idx)
+}
+
+render :: proc(cmds: ^clay.ClayArray(clay.RenderCommand)) {
+	sdl.SetRenderDrawColor(plat.renderer, u8(COL_BG.r), u8(COL_BG.g), u8(COL_BG.b), 255)
+	sdl.RenderClear(plat.renderer)
+	clips := make([dynamic]sdl.Rect, 0, 8, context.temp_allocator)
+	for i in 0 ..< cmds.length {
+		cmd := clay.RenderCommandArray_Get(cmds, i)
+		b := cmd.boundingBox
+		#partial switch cmd.commandType {
+		case .Rectangle:
+			rd := cmd.renderData.rectangle
+			fill_rrect(b, rd.cornerRadius.topLeft, rd.backgroundColor)
+		case .Border:
+			bd := cmd.renderData.border
+			w := bd.width
+			if w.top > 0 do fill_rect(b.x, b.y, b.width, f32(w.top), bd.color)
+			if w.bottom > 0 do fill_rect(b.x, b.y + b.height - f32(w.bottom), b.width, f32(w.bottom), bd.color)
+			if w.left > 0 do fill_rect(b.x, b.y, f32(w.left), b.height, bd.color)
+			if w.right > 0 do fill_rect(b.x + b.width - f32(w.right), b.y, f32(w.right), b.height, bd.color)
+		case .Text:
+			flush_geometry()
+			draw_text_cmd(b, cmd.renderData.text)
+		case .Custom:
+			draw_icon(b, cast(^Icon)cmd.renderData.custom.customData)
+		case .ScissorStart:
+			flush_geometry()
+			r := sdl.Rect{c.int(b.x), c.int(b.y), c.int(math.ceil(b.width)), c.int(math.ceil(b.height))}
+			if len(clips) > 0 {
+				p := clips[len(clips) - 1]
+				x0, y0 := max(r.x, p.x), max(r.y, p.y)
+				x1, y1 := min(r.x + r.w, p.x + p.w), min(r.y + r.h, p.y + p.h)
+				r = {x0, y0, max(0, x1 - x0), max(0, y1 - y0)}
+			}
+			append(&clips, r)
+			sdl.SetRenderClipRect(plat.renderer, &clips[len(clips) - 1])
+		case .ScissorEnd:
+			flush_geometry()
+			pop(&clips)
+			if len(clips) > 0 do sdl.SetRenderClipRect(plat.renderer, &clips[len(clips) - 1])
+			else do sdl.SetRenderClipRect(plat.renderer, nil)
+		}
+	}
+	flush_geometry()
+	sdl.RenderPresent(plat.renderer)
+}
+
+// --- files / time ----------------------------------------------------------
+
+read_file :: proc(path: string, allocator := context.allocator) -> ([]u8, bool) {
+	n: uint
+	p := sdl.LoadFile(strings.clone_to_cstring(path, context.temp_allocator), &n)
+	if p == nil do return nil, false
+	defer sdl.free(p)
+	out := make([]u8, int(n), allocator)
+	copy(out, ([^]u8)(p)[:n])
+	return out, true
 }
 
 write_file :: proc(path: string, data: []u8) -> bool {
-	cpath := make([]u8, len(path) + 1, context.temp_allocator)
-	copy(cpath, path)
-	fd := open(cstring(raw_data(cpath)), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, c.int(0o600))
-	if fd < 0 do return false
-	defer close(fd)
-	off := 0
-	for off < len(data) {
-		n := write(fd, &data[off], c.size_t(len(data)) - c.size_t(off))
-		if n < 0 && errno() == EINTR do continue
-		if n <= 0 do return false
-		off += int(n)
-	}
-	return true
+	return sdl.SaveFile(strings.clone_to_cstring(path, context.temp_allocator), raw_data(data), uint(len(data)))
 }
 
-// --- lifecycle --------------------------------------------------------------
-
-on_start :: proc "c" (a: ^ANativeActivity) {}
-on_stop :: proc "c" (a: ^ANativeActivity) {}
-
-on_resume :: proc "c" (a: ^ANativeActivity) {
-	context = g_ctx
-	plat.resumed = true
-	app_on_resume()
-	request_redraw(0)
-}
-
-on_pause :: proc "c" (a: ^ANativeActivity) {
-	context = g_ctx
-	plat.resumed = false
-	app_save_settings()
-}
-
-on_destroy :: proc "c" (a: ^ANativeActivity) {
-	context = g_ctx
-	if plat.timer_fd > 0 {
-		ALooper_removeFd(plat.looper, plat.timer_fd)
-		close(plat.timer_fd)
-		plat.timer_fd = -1
-	}
-	app_on_destroy()
-	shutdown_gl()
-	plat.activity = nil
-}
-
-on_focus :: proc "c" (a: ^ANativeActivity, has_focus: c.int) {
-	context = g_ctx
-	request_redraw(0)
-}
-
-on_config_changed :: proc "c" (a: ^ANativeActivity) {
-	context = g_ctx
-	update_density()
-	request_redraw(0)
-}
-
-on_content_rect :: proc "c" (a: ^ANativeActivity, r: ^ARect) {
-	context = g_ctx
-	plat.content = r^
-	plat.have_content = true
-	request_redraw(0)
-}
-
-// --- window / GL ------------------------------------------------------------
-
-on_window_created :: proc "c" (a: ^ANativeActivity, window: rawptr) {
-	context = g_ctx
-	plat.window = window
-	if !gfx_init(&plat.gfx, window) {
-		log_info("EGL init failed")
-		gfx_destroy(&plat.gfx)
-		return
-	}
-	renderer_init(&rend)
-	atlas_reset() // force full re-upload into the fresh context
-	atlas_gpu_init()
-	plat.gl_ready = true
-	frame()
-}
-
-on_window_resized :: proc "c" (a: ^ANativeActivity, window: rawptr) {
-	context = g_ctx
-	request_redraw(0)
-}
-
-on_window_redraw :: proc "c" (a: ^ANativeActivity, window: rawptr) {
-	context = g_ctx
-	frame()
-}
-
-on_window_destroyed :: proc "c" (a: ^ANativeActivity, window: rawptr) {
-	context = g_ctx
-	shutdown_gl()
-	plat.window = nil
-}
-
-shutdown_gl :: proc() {
-	if plat.gl_ready || plat.gfx.display != nil {
-		gfx_destroy(&plat.gfx)
-	}
-	plat.gl_ready = false
-}
-
-// --- timer-driven redraw ------------------------------------------------------
-
-request_redraw :: proc(delay_ms: f64) {
-	if plat.timer_fd <= 0 do return
-	due := now_ms() + max(delay_ms, 0)
-	if plat.timer_due != 0 && plat.timer_due <= due do return
-	plat.timer_due = due
-	d := max(delay_ms, 0.05)
-	spec := itimerspec{}
-	spec.it_value.tv_sec = i64(d / 1000)
-	spec.it_value.tv_nsec = i64(math.mod(d, 1000) * 1e6)
-	if spec.it_value.tv_sec == 0 && spec.it_value.tv_nsec == 0 do spec.it_value.tv_nsec = 50_000
-	timerfd_settime(plat.timer_fd, 0, &spec, nil)
-}
-
-on_timer :: proc "c" (fd: c.int, events: c.int, data: rawptr) -> c.int {
-	context = g_ctx
-	buf: u64
-	read(fd, &buf, 8)
-	plat.timer_due = 0
-	frame()
-	return 1
-}
-
-frame :: proc() {
-	defer free_all(context.temp_allocator)
-	app_tick()
-	if !plat.gl_ready || plat.window == nil {
-		ui_end_frame()
-		return
-	}
-	gfx_query_size(&plat.gfx)
-	w, h := f32(plat.gfx.width), f32(plat.gfx.height)
-	if w <= 0 || h <= 0 do return
-
-	// usable area (excludes status bar / IME when the window is resized for it)
-	area := Rect{0, 0, w, h}
-	if plat.have_content {
-		cr := plat.content
-		area = Rect{f32(cr.left), f32(cr.top), f32(cr.right - cr.left), f32(cr.bottom - cr.top)}
-		if area.w <= 0 || area.h <= 0 do area = Rect{0, 0, w, h}
-	}
-
-	ui.animating = false
-	clear(&ui.scrolls)
-	ui_update_pointer()
-	renderer_begin(&rend, w, h, COL_BG)
-	app_draw(area)
-	renderer_flush(&rend)
-	eglSwapBuffers(plat.gfx.display, plat.gfx.surface)
-	ui.last_frame_t = now_ms()
-	ui_end_frame()
-	if ui.animating do request_redraw(0)
-}
-
-// --- input ------------------------------------------------------------------
-
-on_input_created :: proc "c" (a: ^ANativeActivity, queue: rawptr) {
-	context = g_ctx
-	plat.queue = queue
-	AInputQueue_attachLooper(queue, plat.looper, 1, on_input, nil)
-}
-
-on_input_destroyed :: proc "c" (a: ^ANativeActivity, queue: rawptr) {
-	context = g_ctx
-	AInputQueue_detachLooper(queue)
-	plat.queue = nil
-}
-
-on_input :: proc "c" (fd: c.int, events: c.int, data: rawptr) -> c.int {
-	context = g_ctx
-	q := plat.queue
-	if q == nil do return 1
-	ev: rawptr
-	any_event := false
-	for AInputQueue_getEvent(q, &ev) >= 0 {
-		if AInputQueue_preDispatchEvent(q, ev) != 0 do continue
-		handled := handle_input(ev)
-		AInputQueue_finishEvent(q, ev, handled ? 1 : 0)
-		any_event = true
-	}
-	if any_event do request_redraw(0)
-	return 1
-}
-
-handle_input :: proc(ev: rawptr) -> bool {
-	switch AInputEvent_getType(ev) {
-	case AINPUT_EVENT_TYPE_MOTION:
-		action := AMotionEvent_getAction(ev)
-		x := AMotionEvent_getX(ev, 0)
-		y := AMotionEvent_getY(ev, 0)
-		switch action & AMOTION_EVENT_ACTION_MASK {
-		case AMOTION_EVENT_ACTION_DOWN:
-			ui_pointer_down(x, y)
-		case AMOTION_EVENT_ACTION_MOVE:
-			ui_pointer_move(x, y)
-		case AMOTION_EVENT_ACTION_UP:
-			ui_pointer_up(x, y, false)
-		case AMOTION_EVENT_ACTION_CANCEL:
-			ui_pointer_up(x, y, true)
-		case AMOTION_EVENT_ACTION_SCROLL:
-			v := AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_VSCROLL, 0)
-			for s in ui.scrolls {
-				if rect_contains(s.view, x, y) do s.offset -= v * 48 * ui.dp
-			}
-		}
-		return true
-	case AINPUT_EVENT_TYPE_KEY:
-		action := AKeyEvent_getAction(ev)
-		code := AKeyEvent_getKeyCode(ev)
-		meta := AKeyEvent_getMetaState(ev)
-		if code == AKEYCODE_BACK {
-			if action == AKEY_EVENT_ACTION_UP do return app_back()
-			return app_can_go_back()
-		}
-		if action != AKEY_EVENT_ACTION_DOWN do return action == AKEY_EVENT_ACTION_UP && ui.focus != nil
-		ctrl := meta & AMETA_CTRL_ON != 0
-		switch code {
-		case AKEYCODE_DEL:
-			append(&ui.keys, Key.Backspace)
-		case AKEYCODE_FORWARD_DEL:
-			append(&ui.keys, Key.Delete)
-		case AKEYCODE_ENTER, AKEYCODE_NUMPAD_ENTER:
-			if ctrl do app_hotkey_send()
-			else do append(&ui.keys, Key.Enter)
-		case AKEYCODE_DPAD_LEFT:
-			append(&ui.keys, Key.Left)
-		case AKEYCODE_DPAD_RIGHT:
-			append(&ui.keys, Key.Right)
-		case AKEYCODE_DPAD_UP:
-			append(&ui.keys, Key.Up)
-		case AKEYCODE_DPAD_DOWN:
-			append(&ui.keys, Key.Down)
-		case AKEYCODE_MOVE_HOME:
-			append(&ui.keys, Key.Home)
-		case AKEYCODE_MOVE_END:
-			append(&ui.keys, Key.End)
-		case AKEYCODE_ESCAPE:
-			tf_blur()
-		case:
-			if ctrl && code == 50 { // KEYCODE_V
-				append(&ui.keys, Key.Paste)
-				return true
-			}
-			if ui.focus == nil do return false
-			r := key_to_unicode(plat.activity.env, AInputEvent_getDeviceId(ev), code, meta)
-			if r <= 0 do return false
-			b, n := utf8_encode_rune(r)
-			append(&ui.text_input, ..b[:n])
-		}
-		return true
-	}
-	return false
-}
-
-utf8_encode_rune :: proc(r: rune) -> ([4]u8, int) {
-	b: [4]u8
-	c := u32(r)
-	switch {
-	case c < 0x80:
-		b[0] = u8(c)
-		return b, 1
-	case c < 0x800:
-		b[0] = u8(0xC0 | (c >> 6)); b[1] = u8(0x80 | (c & 0x3F))
-		return b, 2
-	case c < 0x10000:
-		b[0] = u8(0xE0 | (c >> 12)); b[1] = u8(0x80 | ((c >> 6) & 0x3F)); b[2] = u8(0x80 | (c & 0x3F))
-		return b, 3
-	case:
-		b[0] = u8(0xF0 | (c >> 18)); b[1] = u8(0x80 | ((c >> 12) & 0x3F)); b[2] = u8(0x80 | ((c >> 6) & 0x3F)); b[3] = u8(0x80 | (c & 0x3F))
-		return b, 4
-	}
-}
-
-// --- platform services used by the UI -------------------------------------------
-
-plat_show_keyboard :: proc(show: bool) {
-	if plat.activity == nil do return
-	if show == ui.keyboard_visible && !show do return
-	ui.keyboard_visible = show
-	soft_keyboard(plat.activity.env, plat.activity.clazz, show)
-	if show do ANativeActivity_showSoftInput(plat.activity, ANATIVEACTIVITY_SHOW_SOFT_INPUT_IMPLICIT)
-	else do ANativeActivity_hideSoftInput(plat.activity, 0)
-}
+now_ms :: proc "contextless" () -> f64 {return f64(sdl.GetTicksNS()) / 1e6}
 
 plat_clipboard_get :: proc() -> string {
-	if plat.activity == nil do return ""
-	return clipboard_get(plat.activity.env, plat.activity.clazz, context.temp_allocator)
+	p := sdl.GetClipboardText()
+	if p == nil do return ""
+	defer sdl.free(p)
+	return strings.clone(string(cstring(p)), context.temp_allocator)
 }
 
 plat_clipboard_set :: proc(s: string) {
-	if plat.activity == nil do return
-	clipboard_set(plat.activity.env, plat.activity.clazz, s)
+	sdl.SetClipboardText(strings.clone_to_cstring(s, context.temp_allocator))
 }
 
-plat_finish :: proc() {
-	if plat.activity != nil do ANativeActivity_finish(plat.activity)
+plat_show_keyboard :: proc(show: bool) {
+	if show do _ = sdl.StartTextInput(plat.window)
+	else do _ = sdl.StopTextInput(plat.window)
 }
 
-// Watch a socket fd on the main looper.
-plat_watch_fd :: proc(fd: c.int, want_write: bool) {
-	ev: c.int = ALOOPER_EVENT_INPUT
-	if want_write do ev |= ALOOPER_EVENT_OUTPUT
-	ALooper_addFd(plat.looper, fd, -2, ev, on_socket, nil)
-}
+// --- main loop ----------------------------------------------------------------
 
-plat_unwatch_fd :: proc(fd: c.int) {
-	ALooper_removeFd(plat.looper, fd)
-}
+g_ctx: runtime.Context
 
-on_socket :: proc "c" (fd: c.int, events: c.int, data: rawptr) -> c.int {
+clay_error :: proc "c" (e: clay.ErrorData) {
 	context = g_ctx
-	keep := net_on_ready(fd, events)
-	request_redraw(0)
-	return keep ? 1 : 0
+	sdl.Log("clay: %.*s", e.errorText.length, e.errorText.chars)
+}
+
+@(export, link_name = "SDL_main")
+sdl_main :: proc "c" (argc: c.int, argv: [^]cstring) -> c.int {
+	context = runtime.default_context()
+	g_ctx = context
+
+	sdl.SetHint(sdl.HINT_ANDROID_TRAP_BACK_BUTTON, "1")
+	sdl.SetHint(sdl.HINT_TOUCH_MOUSE_EVENTS, "0") // we read fingers directly
+	if !sdl.Init(sdl.INIT_VIDEO) || !ttf.Init() {
+		sdl.Log("init failed: %s", sdl.GetError())
+		return 1
+	}
+	plat.window = sdl.CreateWindow("Pi Agent", 0, 0, {.FULLSCREEN, .RESIZABLE, .HIGH_PIXEL_DENSITY})
+	plat.renderer = sdl.CreateRenderer(plat.window, nil)
+	sdl.SetRenderVSync(plat.renderer, 1)
+	plat.engine = ttf.CreateRendererTextEngine(plat.renderer)
+	plat.data_dir = strings.clone(string(sdl.GetAndroidInternalStoragePath()))
+
+	clay.SetMaxElementCount(65536)
+	mem_size := clay.MinMemorySize()
+	arena := clay.CreateArenaWithCapacityAndMemory(uint(mem_size), raw_data(make([]u8, mem_size)))
+	clay.Initialize(arena, {1, 1}, {handler = clay_error})
+	clay.SetMeasureTextFunction(measure_text, nil)
+
+	app_init()
+	plat.dirty = true
+	last := now_ms()
+	running := true
+	for running {
+		ev: sdl.Event
+		wait: i32 = (plat.dirty || now_ms() < plat.active_until) ? 0 : 50
+		if sdl.WaitEventTimeout(&ev, wait) {
+			running = handle_event(&ev)
+			for running && sdl.PollEvent(&ev) do running = handle_event(&ev)
+		}
+		for _ in 0 ..< 64 {
+			if !net_pump(0) do break
+			plat.dirty = true
+		}
+		app_tick()
+		t := now_ms()
+		if plat.dirty || t < plat.active_until {
+			plat.dirty = false
+			frame(f32(min(t - last, 100) / 1000))
+			last = t
+		} else {
+			last = t
+		}
+		free_all(context.temp_allocator)
+	}
+	app_save_settings()
+	return 0
+}
+
+frame :: proc(dt: f32) {
+	w, h: c.int
+	sdl.GetRenderOutputSize(plat.renderer, &w, &h)
+	plat.w, plat.h = f32(w), f32(h)
+	ui.dp = max(sdl.GetWindowDisplayScale(plat.window), 1)
+
+	clay.SetLayoutDimensions({plat.w, plat.h})
+	clay.SetPointerState({ui.px, ui.py}, ui.down && !ui.long_fired)
+	clay.UpdateScrollContainers(true, {0, ui.wheel * 60 * ui.dp}, dt)
+	ui.wheel = 0
+	ui_update()
+
+	clay.BeginLayout()
+	safe: sdl.Rect
+	sdl.GetWindowSafeArea(plat.window, &safe)
+	app_layout(safe)
+	cmds := clay.EndLayout(dt)
+	app_after_layout()
+
+	frame_no += 1
+	render(&cmds)
+	evict_text_cache()
+	ui_end_frame()
+	if ui.animating do plat.active_until = max(plat.active_until, now_ms() + 32)
+}
+
+handle_event :: proc(ev: ^sdl.Event) -> bool {
+	plat.dirty = true
+	#partial switch ev.type {
+	case .QUIT, .TERMINATING:
+		return false
+	case .FINGER_DOWN:
+		ui_pointer_down(ev.tfinger.x * plat.w, ev.tfinger.y * plat.h)
+	case .FINGER_MOTION:
+		ui_pointer_move(ev.tfinger.x * plat.w, ev.tfinger.y * plat.h)
+	case .FINGER_UP:
+		ui_pointer_up(ev.tfinger.x * plat.w, ev.tfinger.y * plat.h, false)
+	case .FINGER_CANCELED:
+		ui_pointer_up(ui.px, ui.py, true)
+	case .MOUSE_BUTTON_DOWN:
+		if ev.button.which != sdl.TOUCH_MOUSEID do ui_pointer_down(ev.button.x * px_scale(), ev.button.y * px_scale())
+	case .MOUSE_MOTION:
+		if ev.motion.which != sdl.TOUCH_MOUSEID {
+			ui.px, ui.py = ev.motion.x * px_scale(), ev.motion.y * px_scale()
+			if ui.down do ui_pointer_move(ui.px, ui.py)
+		}
+	case .MOUSE_BUTTON_UP:
+		if ev.button.which != sdl.TOUCH_MOUSEID do ui_pointer_up(ev.button.x * px_scale(), ev.button.y * px_scale(), false)
+	case .MOUSE_WHEEL:
+		ui.wheel += ev.wheel.y
+	case .TEXT_INPUT:
+		append(&ui.text_input, string(ev.text.text))
+	case .KEY_DOWN:
+		k := ev.key.key
+		ctrl := ev.key.mod & sdl.KMOD_CTRL != {}
+		switch k {
+		case sdl.K_AC_BACK:
+			if !app_back() do sdl.SendAndroidBackButton()
+		case sdl.K_BACKSPACE:
+			append(&ui.keys, Key.Backspace)
+		case sdl.K_DELETE:
+			append(&ui.keys, Key.Delete)
+		case sdl.K_RETURN, sdl.K_KP_ENTER:
+			if ctrl do app_hotkey_send()
+			else do append(&ui.keys, Key.Enter)
+		case sdl.K_LEFT:
+			append(&ui.keys, Key.Left)
+		case sdl.K_RIGHT:
+			append(&ui.keys, Key.Right)
+		case sdl.K_HOME:
+			append(&ui.keys, Key.Home)
+		case sdl.K_END:
+			append(&ui.keys, Key.End)
+		case sdl.K_ESCAPE:
+			tf_blur()
+		case sdl.K_V:
+			if ctrl do append(&ui.keys, Key.Paste)
+		}
+	case .DID_ENTER_FOREGROUND:
+		app_on_resume()
+	case .WILL_ENTER_BACKGROUND:
+		app_save_settings()
+	}
+	return true
 }

@@ -1,25 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Pure-native app: no Java/Kotlin code (hasCode="false"); entry point is libmain.so (Odin). -->
+<!-- UI/logic is Odin (libmain.so). The Java activity is SDL's stock SDLActivity,
+     compiled from SDL's sources by tools/deps.sh; this project has no Java of its own. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.eissar.piagent"
     android:versionCode="1"
     android:versionName="0.1">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+    <uses-feature android:glEsVersion="0x00020000" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="Pi Agent"
-        android:hasCode="false"
+        android:hasCode="true"
         android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="org.libsdl.app.SDLActivity"
             android:exported="true"
             android:label="Pi Agent"
+            android:launchMode="singleInstance"
+            android:alwaysRetainTaskState="true"
             android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density">
-            <meta-data android:name="android.app.lib_name" android:value="main" />
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

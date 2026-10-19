@@ -1,8 +1,11 @@
 # vibe-pi-android
 
-Native Android client for pi-agent-webui, written entirely in **Odin**.
-No Java/Kotlin, no Gradle, no WebView: a `NativeActivity` loads `libmain.so`, which draws its own UI with
-OpenGL ES, rasterizes system TrueType fonts itself, and speaks the webui's WebSocket RPC (`/rpc`).
+Native Android client for pi-agent-webui, written in **Odin** on top of **SDL3** (window, input, IME,
+clipboard), **SDL3_ttf** (text) and **Clay** (declarative layout). No WebView, no Gradle, no project Java:
+the activity is SDL's stock `SDLActivity`, which loads `libmain.so` and calls `SDL_main`.
+
+The earlier dependency-free version (own GL renderer, font rasterizer, NativeActivity) lives on the
+[`odin-native`](../../tree/odin-native) branch.
 
 ## Install via F-Droid
 
@@ -27,14 +30,16 @@ Open the app, enter `<pc-ip>:7860` (plus a token if you set `PI_WEBUI_TOKEN`) an
 
 ## Build
 
-Needs Odin, Android SDK build-tools 34 + platform 34 and NDK r27 in `~/Android/Sdk`.
+Needs Odin, cmake, Android SDK (build-tools 34/36, platform 34) + NDK r27 in `~/Android/Sdk`, and a JDK
+at `~/.local/share/vibe-pi-android/jdk` (for compiling SDL's Java glue and signing the F-Droid index).
 
 ```bash
+tools/deps.sh         # once: fetch + cross-compile SDL3, SDL3_ttf, Clay; build SDL's classes.dex
 ./build.sh            # -> build/pi-agent.apk
 ./build.sh install    # + adb install
 ./release.sh          # bump version, rebuild, regenerate fdroid/repo, commit, push
 ```
 
-Source layout: `src/main.odin` (activity + looper), `android.odin`/`jni.odin` (NDK + JNI bindings),
-`gl.odin` (EGL/GLES renderer), `font.odin`/`text.odin` (TTF rasterizer), `net.odin` (WebSocket),
-`rpc.odin`/`app.odin` (protocol + state), `ui.odin`/`screens.odin`/`chat.odin` (UI).
+Source: `src/main.odin` (SDL loop + Clay renderer), `ui.odin` (input, widgets, icons, text fields),
+`screens.odin` (all screens), `net.odin` (WebSocket), `rpc.odin`/`app.odin` (protocol + state),
+`src/clay/` (Clay's Odin bindings).

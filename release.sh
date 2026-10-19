@@ -11,7 +11,7 @@ if [[ "${1:-}" != "--no-bump" ]]; then
   code=$((code + 1))
   sed -i "s/versionCode=\"[0-9]*\"/versionCode=\"$code\"/; s/versionName=\"[^\"]*\"/versionName=\"0.$code\"/" AndroidManifest.xml
 fi
-./build.sh
+PATH="$D/bin:$PATH" ./build.sh
 cp ~/.config/vibe-pi-android/fdroid-config.yml fdroid/config.yml
 cp build/pi-agent.apk "fdroid/repo/dev.eissar.piagent_$code.apk"
 (cd fdroid && fdroid update)

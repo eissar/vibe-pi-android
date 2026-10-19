@@ -1,554 +1,597 @@
 package main
 
-// Screen drawing: connect, sessions, new session, chat, overlays.
+// All screens, declared with Clay every frame.
 
 import "core:fmt"
-import "core:math"
 import "core:strings"
+import clay "clay"
+import sdl "vendor:sdl3"
 
-HEADER_H :: 56
+CHAT_SCROLL :: "chat-scroll"
+safe_top: u16
+MAX_TOOL_CHARS :: 12000
 
-app_draw :: proc(area: Rect) {
-	overlay := app.dialog.active || app.model_picker
-	saved_tap, saved_lp := ui.tap, ui.long_press
-	if overlay {
-		ui.tap = false
-		ui.long_press = false
+app_layout :: proc(safe: sdl.Rect) {
+	ui.modal = app.dialog.active || app.model_picker
+	top := f32(safe.y)
+	safe_top = u16(max(top, 0))
+	bottom := plat.h - f32(safe.y + safe.h)
+	if clay.UI(clay.ID("root"))({
+		layout = {sizing = {grow(), grow()}, layoutDirection = .TopToBottom, padding = {0, 0, u16(max(top, 0)), u16(max(bottom, 0))}},
+		backgroundColor = COL_BG,
+	}) {
+		switch app.screen {
+		case .Connect:
+			connect_screen()
+		case .Sessions:
+			sessions_screen()
+		case .New_Session:
+			new_session_screen()
+		case .Chat:
+			chat_screen()
+		}
+		ui.modal = false
+		if app.model_picker do model_picker()
+		if app.dialog.active do dialog()
+		toast_view()
 	}
+	if ui.tap && ui.focus != nil do tf_blur() // tap outside any field dismisses the keyboard
+}
 
-	switch app.screen {
-	case .Connect:
-		draw_connect(area)
-	case .Sessions:
-		draw_sessions(area)
-	case .New_Session:
-		draw_new_session(area)
-	case .Chat:
-		draw_chat(area)
-	}
-
-	if overlay {
-		ui.tap, ui.long_press = saved_tap, saved_lp
-		if app.model_picker do draw_model_picker(area)
-		if app.dialog.active do draw_dialog(area)
-	}
-	draw_toast(area)
-
-	// tapping empty space dismisses the keyboard
-	if ui.tap && ui.focus != nil {
-		tf_blur()
-		ui.tap = false
+// Stick the chat to the bottom while new output streams in.
+app_after_layout :: proc() {
+	if app.screen != .Chat do return
+	d := clay.GetScrollContainerData(clay.ID(CHAT_SCROLL))
+	if !d.found do return
+	max_scroll := max(0, d.contentDimensions.height - d.scrollContainerDimensions.height)
+	if ui.down && ui.dragging {
+		app.chat.stick_bottom = -d.scrollPosition.y >= max_scroll - dpx(24)
+	} else if app.chat.stick_bottom {
+		d.scrollPosition.y = -max_scroll
+	} else if -d.scrollPosition.y >= max_scroll - 2 {
+		app.chat.stick_bottom = true
 	}
 }
 
-// --- shared pieces -------------------------------------------------------------------
+// --- shared --------------------------------------------------------------------------
 
-header :: proc(area: Rect, title: string, subtitle := "", back := false) -> (back_tapped: bool, subtitle_tapped: bool) {
-	dp := ui.dp
-	bar := Rect{area.x, area.y, area.w, HEADER_H * dp}
-	draw_rect(&rend, bar, COL_PANEL)
-	draw_rect(&rend, {bar.x, bar.y + bar.h - 1, bar.w, 1}, COL_BORDER)
-	x := bar.x + 16 * dp
-	if back {
-		br := Rect{bar.x + 4 * dp, bar.y + 4 * dp, 48 * dp, 48 * dp}
-		if icon_button(br) do back_tapped = true
-		icon_chevron_left(br.x + br.w / 2, br.y + br.h / 2, 16 * dp, COL_TEXT)
-		x = br.x + br.w + 2 * dp
-	}
-	ts := 17 * dp
-	max_w := bar.x + bar.w - x - 110 * dp
-	if len(subtitle) > 0 {
-		draw_text(&rend, FONT_BOLD, ts, x, bar.y + 8 * dp, fit_text(FONT_BOLD, ts, title, max_w), COL_TEXT)
-		ss := 12.5 * dp
-		sr := Rect{x, bar.y + 31 * dp, max_w, 20 * dp}
-		draw_text(&rend, FONT_SANS, ss, x, sr.y, fit_text(FONT_SANS, ss, subtitle, max_w), COL_DIM)
-		if ui_tap(sr) do subtitle_tapped = true
-	} else {
-		draw_text(&rend, FONT_BOLD, ts, x, bar.y + (bar.h - font_line_height(FONT_BOLD, ts)) / 2, fit_text(FONT_BOLD, ts, title, max_w), COL_TEXT)
+header :: proc(title: string, subtitle := "", back := false) -> (back_tapped, subtitle_tapped: bool) {
+	if clay.UI(clay.ID("header"))({
+		layout = {sizing = {grow(), fixed(56)}, childAlignment = {y = .Center}, padding = {dpu(back ? 4 : 16), dpu(4), 0, 0}, childGap = dpu(4)},
+		backgroundColor = COL_PANEL,
+		border = {color = COL_BORDER, width = {bottom = 1}},
+	}) {
+		if back do back_tapped = icon_button("hdr-back", .Back)
+		sid := clay.ID("hdr-title")
+		if clay.UI(sid)({layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, childGap = dpu(2)}}) {
+			text_line(title, 17, COL_TEXT, FONT_BOLD)
+			if len(subtitle) > 0 do text_line(subtitle, 12.5, COL_DIM)
+		}
+		subtitle_tapped = len(subtitle) > 0 && clicked(sid)
+		header_actions()
 	}
 	return
 }
 
-// Right-aligned header icon slot i (0 = rightmost).
-header_slot :: proc(area: Rect, i: int) -> Rect {
-	dp := ui.dp
-	return {area.x + area.w - (4 + 48 * f32(i + 1)) * dp, area.y + 4 * dp, 48 * dp, 48 * dp}
+// Filled in by each screen right before calling header().
+header_actions_proc: proc()
+header_actions :: proc() {
+	if header_actions_proc != nil do header_actions_proc()
+	header_actions_proc = nil
 }
 
-conn_banner :: proc(area: Rect, y: f32) -> f32 {
-	if conn.state == .Open do return 0
-	dp := ui.dp
-	h := 26 * dp
-	r := Rect{area.x, y, area.w, h}
-	draw_rect(&rend, r, Color{70, 52, 20, 255})
+conn_banner :: proc() {
+	if conn.state == .Open do return
 	msg := "Connecting…"
 	if conn.state == .Closed {
 		secs := max(0, int((app.reconnect_at - now_ms()) / 1000) + 1)
 		msg = app.reconnect_at > 0 ? fmt.tprintf("Disconnected — retrying in %ds (tap to retry)", secs) : "Disconnected (tap to reconnect)"
-		if app.reconnect_at > 0 do request_redraw(500)
+		ui.animating = app.reconnect_at > 0
 	}
-	ss := 12.5 * dp
-	draw_text(&rend, FONT_SANS, ss, r.x + 16 * dp, r.y + (h - font_line_height(FONT_SANS, ss)) / 2, fit_text(FONT_SANS, ss, msg, r.w - 32 * dp), COL_WARN)
-	if ui_tap(r) && conn.state == .Closed {
+	id := clay.ID("banner")
+	if clay.UI(id)({layout = {sizing = {grow(), fit()}, padding = pad(16, 6)}, backgroundColor = {70, 52, 20, 255}}) {
+		text(msg, 12.5, COL_WARN)
+	}
+	if clicked(id) && conn.state == .Closed {
 		app.connect_wanted = true
 		app_connect()
 	}
-	return h
 }
 
-draw_toast :: proc(area: Rect) {
+section_label :: proc(s: string) {
+	text(s, 12.5, COL_DIM, FONT_BOLD)
+}
+
+toast_view :: proc() {
 	if len(app.toast_text) == 0 || now_ms() > app.toast_until do return
-	dp := ui.dp
-	ss := 14 * dp
-	pad := 14 * dp
-	max_w := min(area.w - 48 * dp, 520 * dp)
-	lines := make([dynamic]Line, 0, 4, context.temp_allocator)
-	wrap_text(FONT_SANS, ss, app.toast_text, max_w - pad * 2, &lines)
-	if len(lines) > 4 do resize(&lines, 4)
-	lh := font_line_height(FONT_SANS, ss)
-	widest: f32 = 0
-	for l in lines do widest = max(widest, measure_text(FONT_SANS, ss, app.toast_text[l.start:l.end]))
-	w := widest + pad * 2
-	h := f32(len(lines)) * lh + pad * 1.4
-	r := Rect{area.x + (area.w - w) / 2, area.y + area.h - h - 96 * dp, w, h}
-	draw_rrect(&rend, r, 12 * dp, Color{50, 56, 72, 245})
-	y := r.y + pad * 0.7
-	for l in lines {
-		draw_text(&rend, FONT_SANS, ss, r.x + pad, y, app.toast_text[l.start:l.end], COL_TEXT)
-		y += lh
+	ui.animating = true
+	id := clay.ID("toast")
+	if clay.UI(id)({
+		floating = {attachTo = .Root, attachment = {element = .CenterBottom, parent = .CenterBottom}, offset = {0, -dpx(96)}, zIndex = 100},
+		layout = {sizing = {fit({max = min(plat.w - dpx(48), dpx(520))}), fit()}, padding = pad(14, 10)},
+		backgroundColor = {50, 56, 72, 245},
+		cornerRadius = radius(12),
+	}) {
+		text(app.toast_text, 14)
 	}
-	if ui_tap(r) do app.toast_until = 0
+	if ui.tap && clay.PointerOver(id) do app.toast_until = 0
 }
 
-label :: proc(x, y: f32, s: string, col := COL_DIM) -> f32 {
-	ss := 13 * ui.dp
-	draw_text(&rend, FONT_BOLD, ss, x, y, s, col)
-	return font_line_height(FONT_BOLD, ss) + 6 * ui.dp
-}
+// --- connect --------------------------------------------------------------------------
 
-// --- connect ------------------------------------------------------------------------
-
-draw_connect :: proc(area: Rect) {
-	dp := ui.dp
-	w := min(area.w - 40 * dp, 440 * dp)
-	x := area.x + (area.w - w) / 2
-	y := area.y + max(40 * dp, area.h * 0.12)
-	if ui.focus != nil do y = area.y + 24 * dp
-
-	// logo mark
-	draw_rrect(&rend, {x, y, 44 * dp, 44 * dp}, 12 * dp, COL_ACCENT)
-	draw_text(&rend, FONT_BOLD, 24 * dp, x + 12 * dp, y + 6 * dp, "π", COL_BG)
-	draw_text(&rend, FONT_BOLD, 24 * dp, x + 58 * dp, y + 6 * dp, "Pi Agent", COL_TEXT)
-	y += 60 * dp
-	y += draw_paragraph(x, y, w, "Native Android client for pi-agent-webui. Written in Odin; draws its own UI with OpenGL ES.", 14 * dp, COL_DIM)
-	y += 18 * dp
-
-	y += label(x, y, "SERVER ADDRESS")
-	fh := 48 * dp
-	submitted := text_field(&app.host_field, {x, y, w, fh}, "192.168.1.20:7860", 16 * dp)
-	y += fh + 14 * dp
-	y += label(x, y, "TOKEN (OPTIONAL)")
-	submitted |= text_field(&app.token_field, {x, y, w, fh}, "PI_WEBUI_TOKEN", 16 * dp)
-	y += fh + 20 * dp
-
-	busy := conn.state == .Connecting || conn.state == .Handshake
-	if conn.state == .Open {
-		if button({x, y, w, 48 * dp}, "Open sessions") {
-			tf_blur()
-			app.screen = .Sessions
-		}
-		y += 56 * dp
-		if button({x, y, w, 44 * dp}, "Disconnect", COL_CARD, COL_TEXT) do app_disconnect()
-		y += 52 * dp
-	} else {
-		if button({x, y, w, 48 * dp}, busy ? "Connecting…" : "Connect", enabled = !busy) || (submitted && !busy) {
-			tf_blur()
-			app.ever_connected = false
-			app_connect()
-		}
-		y += 60 * dp
-		if busy {
-			spinner(x + w / 2, y + 10 * dp, 20 * dp, COL_ACCENT)
-			y += 30 * dp
+connect_screen :: proc() {
+	if clay.UI()({layout = {sizing = {grow(), grow()}, childAlignment = {x = .Center}, padding = pad(20, 32)}, clip = {vertical = true, childOffset = clay.GetScrollOffset()}}) {
+		if clay.UI()({layout = {sizing = {grow({max = dpx(440)}), fit()}, layoutDirection = .TopToBottom, childGap = dpu(10)}}) {
+			if clay.UI()({layout = {childGap = dpu(14), childAlignment = {y = .Center}}}) {
+				if clay.UI()({layout = {sizing = {fixed(44), fixed(44)}, childAlignment = {.Center, .Center}}, backgroundColor = COL_ACCENT, cornerRadius = radius(12)}) {
+					text("π", 24, COL_BG, FONT_BOLD)
+				}
+				text("Pi Agent", 24, COL_TEXT, FONT_BOLD)
+			}
+			text("Native Android client for pi-agent-webui. Odin + SDL3 + Clay.", 14, COL_DIM)
+			spacer(10)
+			section_label("SERVER ADDRESS")
+			submitted := text_field("host", &app.host_field, "192.168.1.20:7860")
+			spacer(4)
+			section_label("TOKEN (OPTIONAL)")
+			submitted |= text_field("token", &app.token_field, "PI_WEBUI_TOKEN")
+			spacer(8)
+			busy := conn.state == .Connecting || conn.state == .Handshake
+			if conn.state == .Open {
+				if button("open", "Open sessions") {
+					tf_blur()
+					app.screen = .Sessions
+				}
+				if button("disc", "Disconnect", COL_CARD, COL_TEXT) do app_disconnect()
+			} else if button("connect", busy ? "Connecting…" : "Connect", enabled = !busy) || (submitted && !busy) {
+				tf_blur()
+				app.ever_connected = false
+				app_connect()
+			}
+			if busy do icon(.Spinner, 22, COL_ACCENT)
+			if conn.state == .Closed && len(conn.error) > 0 do text(conn.error, 14, COL_ERROR)
+			spacer(8)
+			text("Tip: the emulator reaches the host at 10.0.2.2. For a phone, run the server with PI_WEBUI_HOST=0.0.0.0 and use your computer's LAN or Tailscale IP.", 12.5, COL_FAINT)
 		}
 	}
-	if conn.state == .Closed && len(conn.error) > 0 {
-		y += draw_paragraph(x, y, w, conn.error, 14 * dp, COL_ERROR) + 10 * dp
-	}
-	y += 10 * dp
-	draw_paragraph(x, y, w, "Tip: on the emulator the host machine is 10.0.2.2. To reach the server from a phone, start it with PI_WEBUI_HOST=0.0.0.0 and use your computer's LAN or Tailscale IP.", 12.5 * dp, COL_FAINT)
 }
 
-draw_paragraph :: proc(x, y, w: f32, text: string, size: f32, col: Color) -> f32 {
-	lines := make([dynamic]Line, 0, 8, context.temp_allocator)
-	wrap_text(FONT_SANS, size, text, w, &lines)
-	lh := font_line_height(FONT_SANS, size)
-	yy := y
-	for l in lines {
-		draw_text(&rend, FONT_SANS, size, x, yy, text[l.start:l.end], col)
-		yy += lh
-	}
-	return yy - y
+spacer :: proc(h: f32) {
+	if clay.UI()({layout = {sizing = {grow(), fixed(h)}}}) {}
 }
 
-// --- sessions ---------------------------------------------------------------------------
+// --- sessions ------------------------------------------------------------------------------
 
-draw_sessions :: proc(area: Rect) {
-	dp := ui.dp
-	header(area, "Sessions")
-	// right icons: new, refresh, server
-	r0 := header_slot(area, 0)
-	if icon_button(r0) do app.screen = .New_Session
-	icon_plus(r0.x + r0.w / 2, r0.y + r0.h / 2, 18 * dp, COL_TEXT)
-	r1 := header_slot(area, 1)
-	if icon_button(r1) && conn.state == .Open {
-		app.sessions_loading = true
-		rpc_call("sessions.list", "", .Sessions_List)
+sessions_screen :: proc() {
+	header_actions_proc = proc() {
+		dot := conn.state == .Open ? COL_OK : (conn.state == .Closed ? COL_ERROR : COL_WARN)
+		if icon_button("srv", .Dot, dot) do app.screen = .Connect
+		if app.sessions_loading {
+			if clay.UI()({layout = {sizing = {fixed(48), fixed(48)}, childAlignment = {.Center, .Center}}}) do icon(.Spinner, 18, COL_TEXT)
+		} else if icon_button("refresh", .Refresh) && conn.state == .Open {
+			app.sessions_loading = true
+			rpc_call("sessions.list", "", .Sessions_List)
+		}
+		if icon_button("new", .Plus) do app.screen = .New_Session
 	}
-	if app.sessions_loading do spinner(r1.x + r1.w / 2, r1.y + r1.h / 2, 18 * dp, COL_TEXT)
-	else do icon_refresh(r1.x + r1.w / 2, r1.y + r1.h / 2, 16 * dp, COL_TEXT)
-	r2 := header_slot(area, 2)
-	if icon_button(r2) do app.screen = .Connect
-	dc := conn.state == .Open ? COL_OK : (conn.state == .Closed ? COL_ERROR : COL_WARN)
-	draw_rrect(&rend, {r2.x + r2.w / 2 - 5 * dp, r2.y + r2.h / 2 - 5 * dp, 10 * dp, 10 * dp}, 5 * dp, dc)
-
-	top := area.y + HEADER_H * dp
-	top += conn_banner(area, top)
-	view := Rect{area.x, top, area.w, area.y + area.h - top}
-
+	header("Sessions")
+	conn_banner()
 	if !app.sessions_loaded {
-		if conn.state == .Open do spinner(view.x + view.w / 2, view.y + 80 * dp, 26 * dp, COL_ACCENT)
+		if conn.state == .Open do centered_spinner()
 		return
 	}
 	if len(app.sessions) == 0 {
-		draw_paragraph(view.x + 24 * dp, view.y + 40 * dp, view.w - 48 * dp, "No sessions yet. Tap + to start one.", 15 * dp, COL_DIM)
+		if clay.UI()({layout = {padding = pad(24, 40)}}) do text("No sessions yet. Tap + to start one.", 15, COL_DIM)
 		return
 	}
-
-	s := &app.sessions_scroll
-	scroll_begin(s, view)
-	pad := 12 * dp
-	item_h := 70 * dp
-	y := view.y + pad - s.offset
-	x := view.x + pad
-	w := view.w - pad * 2
-	for &it in app.sessions {
-		r := Rect{x, y, w, item_h}
-		if r.y + r.h >= view.y && r.y <= view.y + view.h {
-			draw_rrect(&rend, r, 12 * dp, ui_pressed(r) ? COL_CARD_HI : COL_CARD)
-			title := len(it.name) > 0 ? it.name : it.first
-			title = strings.trim_space(title)
-			if i := strings.index_byte(title, '\n'); i >= 0 do title = title[:i]
-			if len(title) == 0 do title = "(empty session)"
-			ts := 15.5 * dp
-			running := app.running_ids[it.id]
-			tw := w - 28 * dp - (running ? 24 * dp : 0)
-			draw_text(&rend, FONT_BOLD, ts, r.x + 14 * dp, r.y + 12 * dp, fit_text(FONT_BOLD, ts, title, tw), COL_TEXT)
-			ss := 12.5 * dp
-			sub := fmt.tprintf("%s  ·  %s  ·  %d msgs", path_base(it.cwd), relative_time(it.mod_time), it.count)
-			draw_text(&rend, FONT_SANS, ss, r.x + 14 * dp, r.y + 40 * dp, fit_text(FONT_SANS, ss, sub, w - 28 * dp), COL_DIM)
-			if running do spinner(r.x + r.w - 22 * dp, r.y + 22 * dp, 14 * dp, COL_OK)
-			if ui_tap(r) do open_session(it)
-			if ui_long_press(r) {
+	if clay.UI(clay.ID("sess-scroll"))({
+		layout = {sizing = {grow(), grow()}, layoutDirection = .TopToBottom, padding = pad(12, 12), childGap = dpu(8)},
+		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
+	}) {
+		for &it, i in app.sessions {
+			id := clay.ID("sess", u32(i))
+			if clay.UI(id)({
+				layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, padding = pad(14, 12), childGap = dpu(6)},
+				backgroundColor = hover_col(id, COL_CARD, COL_CARD_HI),
+				cornerRadius = radius(12),
+			}) {
+				title := strings.trim_space(len(it.name) > 0 ? it.name : it.first)
+				if len(title) == 0 do title = "(empty session)"
+				if clay.UI()({layout = {sizing = {grow(), fit()}, childGap = dpu(8), childAlignment = {y = .Center}}}) {
+					text_line(title, 15.5, COL_TEXT, FONT_BOLD)
+					if app.running_ids[it.id] do icon(.Spinner, 14, COL_OK)
+				}
+				text_line(fmt.tprintf("%s  ·  %s  ·  %d msgs", path_base(it.cwd), relative_time(it.mod_time), it.count), 12.5, COL_DIM)
+			}
+			if clicked(id) do open_session(it)
+			if long_pressed(id) {
 				plat_clipboard_set(it.cwd)
 				toast(fmt.tprintf("Copied path: %s", it.cwd))
 			}
 		}
-		y += item_h + 8 * dp
 	}
-	scroll_end(s, y + s.offset - view.y + pad)
 }
 
-// --- new session -----------------------------------------------------------------------
+centered_spinner :: proc() {
+	if clay.UI()({layout = {sizing = {grow(), fixed(160)}, childAlignment = {.Center, .Center}}}) do icon(.Spinner, 28, COL_ACCENT)
+}
 
-draw_new_session :: proc(area: Rect) {
-	dp := ui.dp
-	back, _ := header(area, "New session", "", true)
+// --- new session ---------------------------------------------------------------------------
+
+new_session_screen :: proc() {
+	back, _ := header("New session", "", true)
 	if back {
 		app_back()
 		return
 	}
-	top := area.y + HEADER_H * dp
-	top += conn_banner(area, top)
-	pad := 16 * dp
-	x := area.x + pad
-	w := area.w - pad * 2
-	y := top + pad
-	y += label(x, y, "WORKING DIRECTORY (ON THE SERVER)")
-	fh := 48 * dp
-	submitted := text_field(&app.cwd_field, {x, y, w, fh}, "/home/me/project", 15 * dp)
-	y += fh + 12 * dp
-	cwd := strings.trim_space(tf_text(&app.cwd_field))
-	if button({x, y, w, 46 * dp}, "Start session", enabled = len(cwd) > 0) || (submitted && len(cwd) > 0) {
-		start_new_session(cwd)
-		return
-	}
-	y += 62 * dp
-	if len(app.recent_cwds) == 0 do return
-	y += label(x, y, "RECENT DIRECTORIES")
-	view := Rect{area.x, y, area.w, area.y + area.h - y}
-	s := &app.new_scroll
-	scroll_begin(s, view)
-	yy := view.y - s.offset
-	row_h := 52 * dp
-	for d in app.recent_cwds {
-		r := Rect{x, yy, w, row_h}
-		if r.y + r.h >= view.y && r.y <= view.y + view.h {
-			draw_rrect(&rend, r, 10 * dp, ui_pressed(r) ? COL_CARD_HI : COL_CARD)
-			draw_text(&rend, FONT_BOLD, 14.5 * dp, r.x + 14 * dp, r.y + 7 * dp, fit_text(FONT_BOLD, 14.5 * dp, path_base(d), w - 28 * dp), COL_TEXT)
-			draw_text(&rend, FONT_MONO, 12 * dp, r.x + 14 * dp, r.y + 29 * dp, fit_text(FONT_MONO, 12 * dp, d, w - 28 * dp), COL_DIM)
-			if ui_tap(r) {
+	conn_banner()
+	if clay.UI(clay.ID("new-scroll"))({
+		layout = {sizing = {grow(), grow()}, layoutDirection = .TopToBottom, padding = pad(16, 16), childGap = dpu(10)},
+		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
+	}) {
+		section_label("WORKING DIRECTORY (ON THE SERVER)")
+		submitted := text_field("cwd", &app.cwd_field, "/home/me/project", 15)
+		cwd := strings.trim_space(tf_text(&app.cwd_field))
+		if button("start", "Start session", enabled = len(cwd) > 0) || (submitted && len(cwd) > 0) {
+			start_new_session(cwd)
+			return
+		}
+		if len(app.recent_cwds) > 0 {
+			spacer(10)
+			section_label("RECENT DIRECTORIES")
+		}
+		for d, i in app.recent_cwds {
+			id := clay.ID("cwd", u32(i))
+			if clay.UI(id)({
+				layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, padding = pad(14, 9), childGap = dpu(4)},
+				backgroundColor = hover_col(id, COL_CARD, COL_CARD_HI),
+				cornerRadius = radius(10),
+			}) {
+				text_line(path_base(d), 14.5, COL_TEXT, FONT_BOLD)
+				text_line(d, 12, COL_DIM, FONT_MONO)
+			}
+			if clicked(id) {
 				tf_set(&app.cwd_field, d)
 				start_new_session(d)
-				scroll_end(s, 0)
-				return
 			}
 		}
-		yy += row_h + 6 * dp
 	}
-	scroll_end(s, yy + s.offset - view.y + 16 * dp)
 }
 
-// --- chat -----------------------------------------------------------------------------
+// --- chat ----------------------------------------------------------------------------------
 
-draw_chat :: proc(area: Rect) {
-	dp := ui.dp
+chat_screen :: proc() {
 	c := &app.chat
-	subtitle := fmt.tprintf("%s  ·  %s", model_label(), path_base(c.cwd))
-	back, sub_tapped := header(area, len(c.title) > 0 ? c.title : "Session", subtitle, true)
+	header_actions_proc = proc() {
+		if len(app.chat.sid) == 0 do return
+		if app.chat.loading {
+			if clay.UI()({layout = {sizing = {fixed(48), fixed(48)}, childAlignment = {.Center, .Center}}}) do icon(.Spinner, 18, COL_TEXT)
+		} else if icon_button("reload", .Refresh) {
+			chat_reload()
+		}
+	}
+	back, sub := header(len(c.title) > 0 ? c.title : "Session", fmt.tprintf("%s  ·  %s", model_label(), path_base(c.cwd)), true)
 	if back {
 		app_back()
 		return
 	}
-	if sub_tapped {
+	if sub {
 		app.model_picker = true
 		tf_set(&app.model_filter, "")
-		app.model_scroll = {}
 		if len(app.models) == 0 do rpc_call("models.list", "", .Models_List)
 	}
-	if len(c.sid) > 0 {
-		r0 := header_slot(area, 0)
-		if icon_button(r0) do chat_reload()
-		if c.loading do spinner(r0.x + r0.w / 2, r0.y + r0.h / 2, 18 * dp, COL_TEXT)
-		else do icon_refresh(r0.x + r0.w / 2, r0.y + r0.h / 2, 16 * dp, COL_TEXT)
+	conn_banner()
+
+	if clay.UI(clay.ID(CHAT_SCROLL))({
+		layout = {sizing = {grow(), grow()}, layoutDirection = .TopToBottom, padding = pad(14, 14), childGap = dpu(14)},
+		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
+	}) {
+		if len(c.messages) == 0 && !c.loading {
+			text(c.is_new ? fmt.tprintf("New session in %s\n\nAsk Pi to do something.", c.cwd) : "No messages yet.", 15, COL_DIM)
+		}
+		for m in c.messages do message_view(m)
+		if c.running || c.loading {
+			if clay.UI()({layout = {childGap = dpu(10), childAlignment = {y = .Center}}}) {
+				icon(.Spinner, 16, COL_ACCENT)
+				text(c.loading ? "Loading…" : (len(c.phase) > 0 ? c.phase : "Streaming…"), 13.5, COL_DIM)
+			}
+		}
 	}
 
-	top := area.y + HEADER_H * dp
-	top += conn_banner(area, top)
+	// jump to bottom
+	if !c.stick_bottom {
+		id := clay.ID("jump")
+		if clay.UI(id)({
+			floating = {attachTo = .ElementWithId, parentId = clay.ID(CHAT_SCROLL).id, attachment = {element = .RightBottom, parent = .RightBottom}, offset = {-dpx(14), -dpx(14)}, zIndex = 5},
+			layout = {sizing = {fixed(44), fixed(44)}, childAlignment = {.Center, .Center}},
+			backgroundColor = COL_CARD_HI,
+			cornerRadius = radius(22),
+		}) {
+			icon(.Chevron_Down, 16, COL_TEXT)
+		}
+		if clicked(id) do c.stick_bottom = true
+	}
 
 	// composer
-	cs := 15.5 * dp
-	btn := 46 * dp
-	pad := 10 * dp
-	comp_w := area.w - pad * 3 - btn
-	comp_h := max(btn, text_field_height(&c.composer, comp_w, cs, 6))
-	bottom_h := comp_h + pad * 2
-	bottom := Rect{area.x, area.y + area.h - bottom_h, area.w, bottom_h}
-	view := Rect{area.x, top, area.w, bottom.y - top}
-
-	// transcript
-	content_pad := 14 * dp
-	cw := view.w - content_pad * 2
-	total: f32 = content_pad
-	for m, i in c.messages {
-		if m.dirty || m.layout_w != cw do layout_message(m, i, cw)
-		if m.height > 0 do total += m.height + 14 * dp
+	if clay.UI()({
+		layout = {sizing = {grow(), fit()}, padding = pad(10, 10), childGap = dpu(10), childAlignment = {y = .Bottom}},
+		backgroundColor = COL_PANEL,
+		border = {color = COL_BORDER, width = {top = 1}},
+	}) {
+		text_field("composer", &c.composer, c.running ? "Queue a follow-up…" : "Message Pi…", 15.5, 160)
+		has_text := len(strings.trim_space(tf_text(&c.composer))) > 0
+		id := clay.ID("send")
+		stop := c.running && !has_text
+		bg := stop ? Color{200, 80, 80, 255} : (has_text ? COL_ACCENT : COL_CARD)
+		if clay.UI(id)({layout = {sizing = {fixed(46), fixed(46)}, childAlignment = {.Center, .Center}}, backgroundColor = hover_col(id, bg, lighten(bg)), cornerRadius = radius(23)}) {
+			icon(stop ? .Stop : .Send, 16, stop ? COL_TEXT : (has_text ? COL_BG : COL_FAINT))
+		}
+		if clicked(id) {
+			if stop do chat_abort()
+			else if has_text do chat_send()
+		}
 	}
-	status_h: f32 = 0
-	if c.running || c.loading do status_h = 36 * dp
-	total += status_h + content_pad
+}
 
-	s := &c.scroll
-	if c.stick_bottom do s.offset = max(0, total - view.h)
-	scroll_begin(s, view)
-	y := view.y + content_pad - s.offset
-	for m in c.messages {
-		if m.height <= 0 do continue
-		if y + m.height >= view.y && y <= view.y + view.h {
-			draw_message(m, view.x + content_pad, y)
-			r := Rect{view.x, y, view.w, m.height}
-			if ui_long_press(r) {
-				plat_clipboard_set(message_plain_text(m))
-				toast("Copied message")
+// Splits text blocks into paragraphs / fenced code / headings once per message.
+parse_parts :: proc(m: ^Message) {
+	m.parsed = true
+	for blk, bi in m.blocks {
+		if blk.kind != .Text do continue
+		s := blk.text
+		para_start := -1
+		code_start := -1
+		i := 0
+		flush :: proc(m: ^Message, s: string, a, b, bi: int) {
+			t := strings.trim(s[a:b], "\n ")
+			if len(t) > 0 do append(&m.parts, Part{.Para, t, bi})
+		}
+		for i < len(s) {
+			e := strings.index_byte(s[i:], '\n')
+			end := e < 0 ? len(s) : i + e
+			line := s[i:end]
+			tl := strings.trim_left_space(line)
+			switch {
+			case strings.has_prefix(tl, "```"):
+				if code_start < 0 {
+					if para_start >= 0 do flush(m, s, para_start, i, bi)
+					para_start = -1
+					code_start = min(end + 1, len(s))
+				} else {
+					append(&m.parts, Part{.Code, strings.trim_right(s[code_start:i], "\n"), bi})
+					code_start = -1
+				}
+			case code_start >= 0:
+			case strings.has_prefix(tl, "#"):
+				lvl := 0
+				for lvl < len(tl) && tl[lvl] == '#' do lvl += 1
+				if lvl < len(tl) && tl[lvl] == ' ' {
+					if para_start >= 0 do flush(m, s, para_start, i, bi)
+					para_start = -1
+					append(&m.parts, Part{.Heading, tl[lvl + 1:], bi})
+				} else if para_start < 0 {
+					para_start = i
+				}
+			case:
+				if para_start < 0 do para_start = i
+			}
+			i = end + 1
+		}
+		if code_start >= 0 do append(&m.parts, Part{.Code, strings.trim_right(s[code_start:], "\n"), bi})
+		else if para_start >= 0 do flush(m, s, para_start, len(s), bi)
+	}
+}
+
+message_view :: proc(m: ^Message) {
+	if m.role == .Tool_Result && app.chat.calls[m.tool_call_id] != nil do return // shown inside its call
+	if !m.parsed do parse_parts(m)
+	id := clay.ID("msg", u32(m.uid))
+	if m.role == .User {
+		if clay.UI(id)({layout = {sizing = {grow(), fit()}, childAlignment = {x = .Right}}}) {
+			if clay.UI()({layout = {sizing = {fit({max = plat.w * 0.8}), fit()}, padding = pad(12, 9)}, backgroundColor = COL_USER, cornerRadius = radius(14)}) {
+				text(strings.trim_space(message_plain_text(m)), 15)
 			}
 		}
-		y += m.height + 14 * dp
-	}
-	if status_h > 0 {
-		spinner(view.x + content_pad + 9 * dp, y + 14 * dp, 16 * dp, COL_ACCENT)
-		phase := c.loading ? "Loading…" : (len(c.phase) > 0 ? c.phase : "Streaming…")
-		draw_text(&rend, FONT_SANS, 13.5 * dp, view.x + content_pad + 26 * dp, y + 14 * dp - font_line_height(FONT_SANS, 13.5 * dp) / 2, phase, COL_DIM)
-	}
-	if len(c.messages) == 0 && !c.loading {
-		msg := c.is_new ? fmt.tprintf("New session in %s\n\nAsk Pi to do something.", c.cwd) : "No messages yet."
-		draw_paragraph(view.x + 28 * dp, view.y + 60 * dp, view.w - 56 * dp, msg, 15 * dp, COL_DIM)
-	}
-	scroll_end(s, total)
-	if s.dragged || s.velocity != 0 {
-		c.stick_bottom = scroll_at_bottom(s)
-		s.dragged = false
-	}
-
-	// jump-to-bottom button
-	if !c.stick_bottom && total > view.h {
-		jr := Rect{view.x + view.w - 58 * dp, view.y + view.h - 58 * dp, 44 * dp, 44 * dp}
-		draw_rrect(&rend, jr, 22 * dp, COL_CARD_HI)
-		icon_chevron(jr.x + jr.w / 2, jr.y + jr.h / 2, 14 * dp, true, COL_TEXT)
-		if ui_tap(jr) {
-			c.stick_bottom = true
-			s.velocity = 0
-		}
-	}
-
-	// bottom bar
-	draw_rect(&rend, bottom, COL_PANEL)
-	draw_rect(&rend, {bottom.x, bottom.y, bottom.w, 1}, COL_BORDER)
-	fr := Rect{bottom.x + pad, bottom.y + pad, comp_w, comp_h}
-	text_field(&c.composer, fr, c.running ? "Queue a follow-up…" : "Message Pi…", cs, 6)
-	br := Rect{fr.x + fr.w + pad, bottom.y + bottom_h - pad - btn, btn, btn}
-	has_text := len(strings.trim_space(tf_text(&c.composer))) > 0
-	if c.running && !has_text {
-		draw_rrect(&rend, br, btn / 2, ui_pressed(br) ? COL_ERROR : Color{200, 80, 80, 255})
-		icon_stop(br.x + br.w / 2, br.y + br.h / 2, 14 * dp, COL_TEXT)
-		if ui_tap(br) do chat_abort()
 	} else {
-		col := has_text ? COL_ACCENT : COL_CARD
-		if ui_pressed(br) && has_text do col = COL_ACCENT_D
-		draw_rrect(&rend, br, btn / 2, col)
-		icon_send(br.x + br.w / 2 + 1 * dp, br.y + br.h / 2, 16 * dp, has_text ? COL_BG : COL_FAINT)
-		if ui_tap(br) && has_text do chat_send()
+		if clay.UI(id)({layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, childGap = dpu(6)}}) {
+			if m.role != .Assistant && len(m.label) > 0 do text(m.label, 12.5, COL_FAINT)
+			pi := 0
+			for blk, bi in m.blocks {
+				switch blk.kind {
+				case .Text:
+					for pi < len(m.parts) && m.parts[pi].block == bi {
+						p := m.parts[pi]
+						pi += 1
+						switch p.kind {
+						case .Para:
+							text(p.text, 15)
+						case .Heading:
+							text(p.text, 17, COL_TEXT, FONT_BOLD)
+						case .Code:
+							code_box(p.text, COL_TEXT)
+						}
+					}
+				case .Thinking:
+					thinking_view(m, bi, blk)
+				case .Tool_Call:
+					tool_view(blk.name, blk.summary, blk.call_id, blk.text, nil)
+				case .Image:
+					text("[image]", 12.5, COL_DIM)
+				case .Error:
+					if clay.UI()({layout = {sizing = {grow(), fit()}, padding = pad(10, 8)}, backgroundColor = COL_ERR_BG, cornerRadius = radius(8)}) {
+						text(blk.text, 13, COL_ERROR)
+					}
+				}
+			}
+			if m.role == .Tool_Result do tool_view(len(m.tool_name) > 0 ? m.tool_name : "tool result", "", m.tool_call_id, "", m)
+		}
+	}
+	if long_pressed(id) {
+		plat_clipboard_set(message_plain_text(m))
+		toast("Copied message")
 	}
 }
 
-// --- overlays ---------------------------------------------------------------------------
+code_box :: proc(s: string, col: Color) {
+	body := s
+	more := 0
+	if len(body) > MAX_TOOL_CHARS {
+		cut := MAX_TOOL_CHARS
+		for cut > 0 && (body[cut] & 0xC0) == 0x80 do cut -= 1
+		more = len(body) - cut
+		body = body[:cut]
+	}
+	if clay.UI()({layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, padding = pad(10, 8)}, backgroundColor = COL_CODE_BG, cornerRadius = radius(8)}) {
+		text(body, 13, col, FONT_MONO)
+		if more > 0 do text(fmt.tprintf("… (%d more characters)", more), 12, COL_FAINT)
+	}
+}
 
-draw_model_picker :: proc(area: Rect) {
-	dp := ui.dp
-	draw_rect(&rend, area, COL_BG)
-	back, _ := header(area, "Choose model", "", true)
-	if back {
-		app.model_picker = false
-		tf_blur()
-		return
+thinking_view :: proc(m: ^Message, bi: int, blk: Block) {
+	key := fmt.tprintf("think:%d:%d", m.uid, bi)
+	open := app.expanded[key]
+	id := clay.ID(key)
+	if clay.UI(id)({layout = {sizing = {grow(), fixed(32)}, childGap = dpu(8), childAlignment = {y = .Center}, padding = pad(2, 0)}, backgroundColor = pressed(id) ? COL_CARD : {}, cornerRadius = radius(8)}) {
+		icon(open ? .Chevron_Down : .Chevron_Right, 14, COL_FAINT)
+		text("Thinking", 12.5, COL_FAINT, FONT_BOLD, .None)
+		if !open do text_line(strings.trim_space(blk.text), 12.5, COL_FAINT)
 	}
-	top := area.y + HEADER_H * dp
-	pad := 12 * dp
-	fh := 46 * dp
-	text_field(&app.model_filter, {area.x + pad, top + pad, area.w - pad * 2, fh}, "Filter models", 15 * dp)
-	top += fh + pad * 2
-	view := Rect{area.x, top, area.w, area.y + area.h - top}
-	filter := strings.to_lower(strings.trim_space(tf_text(&app.model_filter)), context.temp_allocator)
-	s := &app.model_scroll
-	scroll_begin(s, view)
-	y := view.y - s.offset
-	row_h := 56 * dp
-	x := area.x + pad
-	w := area.w - pad * 2
-	if len(app.models) == 0 {
-		draw_paragraph(x + 8 * dp, y + 20 * dp, w, "No models available (configure providers in the web UI).", 14 * dp, COL_DIM)
-	}
-	for m in app.models {
-		if len(filter) > 0 {
-			hay := strings.to_lower(fmt.tprintf("%s %s %s", m.name, m.id, m.provider), context.temp_allocator)
-			if !strings.contains(hay, filter) do continue
+	if clicked(id) do toggle_expanded(key)
+	if open {
+		if clay.UI()({layout = {sizing = {grow(), fit()}, padding = {dpu(14), 0, 0, 0}}, border = {color = COL_BORDER, width = {left = dpu(2)}}}) {
+			text(strings.trim_space(blk.text), 13, COL_THINK)
 		}
-		r := Rect{x, y, w, row_h}
-		if r.y + r.h >= view.y && r.y <= view.y + view.h {
-			sel := m.id == app.chat.model_id && m.provider == app.chat.provider
-			draw_rrect(&rend, r, 10 * dp, sel ? COL_USER : (ui_pressed(r) ? COL_CARD_HI : COL_CARD))
-			name := len(m.name) > 0 ? m.name : m.id
-			draw_text(&rend, FONT_BOLD, 14.5 * dp, r.x + 14 * dp, r.y + 8 * dp, fit_text(FONT_BOLD, 14.5 * dp, name, w - 28 * dp), COL_TEXT)
-			draw_text(&rend, FONT_SANS, 12 * dp, r.x + 14 * dp, r.y + 31 * dp, fit_text(FONT_SANS, 12 * dp, fmt.tprintf("%s / %s", m.provider, m.id), w - 28 * dp), COL_DIM)
-			if ui_tap(r) {
-				chat_set_model_remote(m)
-				app.model_picker = false
-				tf_blur()
+	}
+}
+
+tool_view :: proc(name, summary, call_id, args: string, orphan: ^Message) {
+	key := fmt.tprintf("tool:%s", call_id)
+	open := app.expanded[key]
+	result := orphan
+	if result == nil do result = app.chat.results[call_id]
+	status := 0
+	if app.chat.running_tools[call_id] do status = 1
+	else if result != nil do status = result.is_error ? 3 : 2
+	hid := clay.ID(key)
+	if clay.UI()({layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom}, backgroundColor = COL_CARD, cornerRadius = radius(10)}) {
+		if clay.UI(hid)({layout = {sizing = {grow(), fixed(40)}, childGap = dpu(8), childAlignment = {y = .Center}, padding = pad(10, 0)}, backgroundColor = pressed(hid) ? COL_CARD_HI : {}, cornerRadius = radius(10)}) {
+			icon(open ? .Chevron_Down : .Chevron_Right, 14, COL_DIM)
+			text(name, 14, COL_TEXT, FONT_BOLD, .None)
+			if clay.UI()({layout = {sizing = {grow(), fit()}}, clip = {horizontal = true}}) do text(summary, 13, COL_DIM, FONT_MONO, .None)
+			switch status {
+			case 1: icon(.Spinner, 14, COL_WARN)
+			case 2: icon(.Dot, 10, COL_OK)
+			case 3: icon(.Dot, 10, COL_ERROR)
+			case: icon(.Dot, 10, COL_FAINT)
 			}
 		}
-		y += row_h + 6 * dp
+		if open {
+			if clay.UI()({layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, padding = {dpu(12), dpu(12), 0, dpu(12)}, childGap = dpu(6)}}) {
+				if len(args) > 0 {
+					section_label("INPUT")
+					code_box(args, COL_TEXT)
+				}
+				out := result != nil ? message_plain_text(result) : (status == 1 ? "(running…)" : "")
+				if len(out) > 0 {
+					section_label(status == 3 ? "ERROR" : "OUTPUT")
+					code_box(out, status == 3 ? COL_ERROR : COL_TEXT)
+				}
+			}
+		}
 	}
-	scroll_end(s, y + s.offset - view.y + pad)
-	ui.tap = false // modal
+	if clicked(hid) do toggle_expanded(key)
 }
 
-dialog_scroll: Scroll
+toggle_expanded :: proc(key: string) {
+	if v, ok := app.expanded[key]; ok do app.expanded[key] = !v
+	else do app.expanded[strings.clone(key)] = true
+}
 
-draw_dialog :: proc(area: Rect) {
-	dp := ui.dp
+// --- overlays ------------------------------------------------------------------------------
+
+model_picker :: proc() {
+	if clay.UI(clay.ID("picker"))({
+		floating = {attachTo = .Root, zIndex = 50},
+		layout = {sizing = {fixed(plat.w / ui.dp), fixed(plat.h / ui.dp)}, layoutDirection = .TopToBottom, padding = {0, 0, safe_top, 0}},
+		backgroundColor = COL_BG,
+	}) {
+		back, _ := header("Choose model", "", true)
+		if back {
+			app.model_picker = false
+			tf_blur()
+			return
+		}
+		if clay.UI()({layout = {sizing = {grow(), fit()}, padding = pad(12, 12)}}) do text_field("filter", &app.model_filter, "Filter models", 15)
+		filter := strings.to_lower(strings.trim_space(tf_text(&app.model_filter)), context.temp_allocator)
+		if clay.UI(clay.ID("models"))({
+			layout = {sizing = {grow(), grow()}, layoutDirection = .TopToBottom, padding = pad(12, 4), childGap = dpu(6)},
+			clip = {vertical = true, childOffset = clay.GetScrollOffset()},
+		}) {
+			if len(app.models) == 0 do text("No models available (configure providers in the web UI).", 14, COL_DIM)
+			for m, i in app.models {
+				if len(filter) > 0 && !strings.contains(strings.to_lower(fmt.tprintf("%s %s %s", m.name, m.id, m.provider), context.temp_allocator), filter) do continue
+				id := clay.ID("model", u32(i))
+				sel := m.id == app.chat.model_id && m.provider == app.chat.provider
+				if clay.UI(id)({
+					layout = {sizing = {grow(), fit()}, layoutDirection = .TopToBottom, padding = pad(14, 9), childGap = dpu(4)},
+					backgroundColor = sel ? COL_USER : hover_col(id, COL_CARD, COL_CARD_HI),
+					cornerRadius = radius(10),
+				}) {
+					text_line(len(m.name) > 0 ? m.name : m.id, 14.5, COL_TEXT, FONT_BOLD)
+					text_line(fmt.tprintf("%s / %s", m.provider, m.id), 12, COL_DIM)
+				}
+				if clicked(id) {
+					chat_set_model_remote(m)
+					app.model_picker = false
+					tf_blur()
+				}
+			}
+		}
+	}
+	ui.tap = false
+}
+
+dialog :: proc() {
 	d := &app.dialog
-	draw_rect(&rend, area, Color{0, 0, 0, 170})
-	w := min(area.w - 32 * dp, 460 * dp)
-	pad := 18 * dp
-	inner := w - pad * 2
-	// measure
-	ts := 16.5 * dp
-	ms := 14 * dp
-	tl := make([dynamic]Line, 0, 4, context.temp_allocator)
-	wrap_text(FONT_BOLD, ts, d.title, inner, &tl)
-	ml := make([dynamic]Line, 0, 8, context.temp_allocator)
-	if len(d.message) > 0 do wrap_text(FONT_SANS, ms, d.message, inner, &ml)
-	h := pad * 2 + f32(len(tl)) * font_line_height(FONT_BOLD, ts) + 10 * dp
-	if len(ml) > 0 do h += f32(min(len(ml), 12)) * font_line_height(FONT_SANS, ms) + 12 * dp
-	opt_h := 48 * dp
-	switch d.method {
-	case "select":
-		h += min(f32(len(d.options)) * (opt_h + 6 * dp), area.h * 0.5) + 50 * dp
-	case "confirm":
-		h += 52 * dp
-	case "input":
-		h += 48 * dp + 64 * dp
-	case "editor":
-		h += 140 * dp + 64 * dp
-	}
-	h = min(h, area.h - 32 * dp)
-	r := Rect{area.x + (area.w - w) / 2, area.y + max(16 * dp, (area.h - h) / 2), w, h}
-	draw_rrect(&rend, r, 16 * dp, COL_PANEL)
-	x := r.x + pad
-	y := r.y + pad
-	for l in tl {
-		draw_text(&rend, FONT_BOLD, ts, x, y, d.title[l.start:l.end], COL_TEXT)
-		y += font_line_height(FONT_BOLD, ts)
-	}
-	y += 10 * dp
-	for l, i in ml {
-		if i >= 12 do break
-		draw_text(&rend, FONT_SANS, ms, x, y, d.message[l.start:l.end], COL_DIM)
-		y += font_line_height(FONT_SANS, ms)
-	}
-	if len(ml) > 0 do y += 12 * dp
-	half := (inner - 10 * dp) / 2
-	switch d.method {
-	case "select":
-		list_h := r.y + r.h - pad - 50 * dp - y
-		view := Rect{x, y, inner, list_h}
-		scroll_begin(&dialog_scroll, view)
-		yy := y - dialog_scroll.offset
-		for o in d.options {
-			orr := Rect{x, yy, inner, opt_h}
-			draw_rrect(&rend, orr, 10 * dp, ui_pressed(orr) ? COL_CARD_HI : COL_CARD)
-			draw_text(&rend, FONT_SANS, 14.5 * dp, orr.x + 14 * dp, orr.y + (opt_h - font_line_height(FONT_SANS, 14.5 * dp)) / 2, fit_text(FONT_SANS, 14.5 * dp, o, inner - 28 * dp), COL_TEXT)
-			if ui_tap(orr) {
-				scroll_end(&dialog_scroll, 0)
-				dialog_respond(o, false, false)
-				return
+	if clay.UI()({
+		floating = {attachTo = .Root, zIndex = 60},
+		layout = {sizing = {fixed(plat.w / ui.dp), fixed(plat.h / ui.dp)}, childAlignment = {.Center, .Center}, padding = pad(16, 16)},
+		backgroundColor = COL_SHADE,
+	}) {
+		if clay.UI()({
+			layout = {sizing = {grow({max = dpx(460)}), fit({max = plat.h - dpx(32)})}, layoutDirection = .TopToBottom, padding = pad(18, 18), childGap = dpu(12)},
+			backgroundColor = COL_PANEL,
+			cornerRadius = radius(16),
+		}) {
+			text(d.title, 16.5, COL_TEXT, FONT_BOLD)
+			if len(d.message) > 0 do text(d.message, 14, COL_DIM)
+			switch d.method {
+			case "select":
+				if clay.UI(clay.ID("dlg-opts"))({layout = {sizing = {grow(), fit({max = plat.h * 0.5})}, layoutDirection = .TopToBottom, childGap = dpu(6)}, clip = {vertical = true, childOffset = clay.GetScrollOffset()}}) {
+					for o, i in d.options {
+						id := clay.ID("opt", u32(i))
+						if clay.UI(id)({layout = {sizing = {grow(), fit({min = dpx(46)})}, padding = pad(14, 12)}, backgroundColor = hover_col(id, COL_CARD, COL_CARD_HI), cornerRadius = radius(10)}) do text(o, 14.5)
+						if clicked(id) {
+							dialog_respond(o, false, false)
+							return
+						}
+					}
+				}
+				if button("dlg-cancel", "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, true)
+			case "confirm":
+				if clay.UI()({layout = {sizing = {grow(), fit()}, childGap = dpu(10)}}) {
+					if button("dlg-no", "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, false)
+					else if button("dlg-yes", "Confirm") do dialog_respond("", true, false)
+				}
+			case "input", "editor":
+				d.field.multiline = d.method == "editor"
+				submitted := text_field("dlg-field", &d.field, "", 15, d.method == "editor" ? 200 : 48)
+				if clay.UI()({layout = {sizing = {grow(), fit()}, childGap = dpu(10)}}) {
+					if button("dlg-cancel", "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, true)
+					else if button("dlg-ok", "OK") || submitted do dialog_respond(tf_text(&d.field), false, false)
+				}
 			}
-			yy += opt_h + 6 * dp
 		}
-		scroll_end(&dialog_scroll, yy + dialog_scroll.offset - y)
-		if button({x, r.y + r.h - pad - 42 * dp, inner, 42 * dp}, "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, true)
-	case "confirm":
-		by := r.y + r.h - pad - 44 * dp
-		if button({x, by, half, 44 * dp}, "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, false)
-		else if button({x + half + 10 * dp, by, half, 44 * dp}, "Confirm") do dialog_respond("", true, false)
-	case "input", "editor":
-		fh := d.method == "editor" ? 140 * dp : 48 * dp
-		d.field.multiline = d.method == "editor"
-		submitted := text_field(&d.field, {x, y, inner, fh}, "", 15 * dp, 6)
-		by := r.y + r.h - pad - 44 * dp
-		if button({x, by, half, 44 * dp}, "Cancel", COL_CARD, COL_TEXT) do dialog_respond("", false, true)
-		else if button({x + half + 10 * dp, by, half, 44 * dp}, "OK") || submitted do dialog_respond(tf_text(&d.field), false, false)
 	}
-	ui.tap = false // modal: swallow taps outside
+	ui.tap = false
 }
-
-_ :: math

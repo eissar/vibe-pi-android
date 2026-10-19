@@ -4,6 +4,82 @@ package main
 // main ALooper. ws:// only (use a LAN / VPN such as Tailscale for remote use).
 
 import "core:c"
+
+foreign import libc_ "system:c"
+
+// Bionic socket API (Bionic's addrinfo puts canonname before addr, unlike glibc).
+addrinfo :: struct {
+	ai_flags, ai_family, ai_socktype, ai_protocol: c.int,
+	ai_addrlen:   u32,
+	ai_canonname: cstring,
+	ai_addr:      rawptr,
+	ai_next:      ^addrinfo,
+}
+pollfd :: struct {
+	fd:      c.int,
+	events:  i16,
+	revents: i16,
+}
+
+SOCK_STREAM  :: 1
+IPPROTO_TCP  :: 6
+TCP_NODELAY  :: 1
+SOL_SOCKET   :: 1
+SO_ERROR     :: 4
+SO_KEEPALIVE :: 9
+O_NONBLOCK   :: 0o4000
+O_CLOEXEC    :: 0o2000000
+MSG_NOSIGNAL :: 0x4000
+EAGAIN       :: 11
+EINTR        :: 4
+EINPROGRESS  :: 115
+POLLIN       :: 1
+POLLOUT      :: 4
+POLLERR      :: 8
+POLLHUP      :: 16
+
+@(default_calling_convention = "c")
+foreign libc_ {
+	__errno :: proc() -> ^c.int ---
+	getaddrinfo :: proc(node, service: cstring, hints: ^addrinfo, res: ^^addrinfo) -> c.int ---
+	freeaddrinfo :: proc(res: ^addrinfo) ---
+	gai_strerror :: proc(err: c.int) -> cstring ---
+	strerror :: proc(err: c.int) -> cstring ---
+	socket :: proc(domain, type, protocol: c.int) -> c.int ---
+	connect :: proc(fd: c.int, addr: rawptr, len: u32) -> c.int ---
+	send :: proc(fd: c.int, buf: rawptr, len: c.size_t, flags: c.int) -> c.ssize_t ---
+	recv :: proc(fd: c.int, buf: rawptr, len: c.size_t, flags: c.int) -> c.ssize_t ---
+	close :: proc(fd: c.int) -> c.int ---
+	setsockopt :: proc(fd: c.int, level, name: c.int, val: rawptr, len: u32) -> c.int ---
+	getsockopt :: proc(fd: c.int, level, name: c.int, val: rawptr, len: ^u32) -> c.int ---
+	poll :: proc(fds: [^]pollfd, n: c.ulong, timeout: c.int) -> c.int ---
+	arc4random_buf :: proc(buf: rawptr, n: c.size_t) ---
+}
+
+errno :: proc "contextless" () -> c.int {return __errno()^}
+
+// Odin's core:c/libc expects glibc's __errno_location; Bionic only has __errno.
+@(export, link_name = "__errno_location")
+errno_location_shim :: proc "c" () -> ^c.int {return __errno()}
+
+// Called every main-loop iteration: waits up to timeout_ms for socket activity.
+net_pump :: proc(timeout_ms: c.int) -> bool {
+	cn := &conn
+	if cn.state == .Closed || cn.fd < 0 do return false
+	pfd := pollfd{fd = cn.fd, events = POLLIN}
+	if cn.state == .Connecting || len(cn.wbuf) > 0 do pfd.events |= POLLOUT
+	if poll(&pfd, 1, timeout_ms) <= 0 do return false
+	ev: c.int
+	if pfd.revents & POLLIN != 0 do ev |= EV_READ
+	if pfd.revents & POLLOUT != 0 do ev |= EV_WRITE
+	if pfd.revents & (POLLERR | POLLHUP) != 0 do ev |= EV_ERROR
+	net_on_ready(cn.fd, ev)
+	return true
+}
+
+EV_READ  :: 1
+EV_WRITE :: 2
+EV_ERROR :: 4
 import "core:encoding/base64"
 import "core:strings"
 import "core:fmt"
@@ -26,7 +102,6 @@ Conn :: struct {
 	frag:      [dynamic]u8,
 	frag_op:   u8,
 	error:     string,
-	want_write: bool,
 }
 
 conn: Conn
@@ -102,13 +177,11 @@ net_connect :: proc(cn: ^Conn, host, port, path: string) -> bool {
 	}
 	cn.fd = fd
 	cn.state = .Connecting
-	plat_watch_fd(fd, true)
 	return true
 }
 
 net_close :: proc(cn: ^Conn, reason: string) {
 	if cn.state != .Closed && cn.fd > 0 {
-		plat_unwatch_fd(cn.fd)
 		close(cn.fd)
 	}
 	cn.fd = -1
@@ -148,10 +221,6 @@ flush :: proc(cn: ^Conn) -> bool {
 			e := errno()
 			if e == EINTR do continue
 			if e == EAGAIN {
-				if !cn.want_write {
-					cn.want_write = true
-					plat_watch_fd(cn.fd, true)
-				}
 				return true
 			}
 			net_close(cn, concat("send(): ", string(strerror(e))))
@@ -159,10 +228,6 @@ flush :: proc(cn: ^Conn) -> bool {
 			return false
 		}
 		remove_range(&cn.wbuf, 0, int(n))
-	}
-	if cn.want_write {
-		cn.want_write = false
-		plat_watch_fd(cn.fd, false)
 	}
 	return true
 }
@@ -214,7 +279,7 @@ net_on_ready :: proc(fd: c.int, events: c.int) -> bool {
 	if fd != cn.fd || cn.state == .Closed do return false
 
 	if cn.state == .Connecting {
-		if events & (ALOOPER_EVENT_OUTPUT | ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP) != 0 {
+		if events & (EV_WRITE | EV_ERROR) != 0 {
 			err: c.int
 			l := u32(size_of(c.int))
 			getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l)
@@ -224,17 +289,16 @@ net_on_ready :: proc(fd: c.int, events: c.int) -> bool {
 				return false
 			}
 			cn.state = .Handshake
-			plat_watch_fd(fd, false)
 			send_handshake(cn)
 		}
 		return cn.state != .Closed
 	}
 
-	if events & ALOOPER_EVENT_OUTPUT != 0 {
+	if events & EV_WRITE != 0 {
 		if !flush(cn) do return false
 	}
 
-	if events & (ALOOPER_EVENT_INPUT | ALOOPER_EVENT_HANGUP | ALOOPER_EVENT_ERROR) != 0 {
+	if events & (EV_READ | EV_ERROR) != 0 {
 		buf: [32768]u8
 		for {
 			n := recv(fd, &buf[0], len(buf), 0)
