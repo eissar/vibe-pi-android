@@ -197,13 +197,43 @@ class AppState(app: Application) : AndroidViewModel(app) {
         setRunning(r.strs("runningSessionIds"))
     }
 
+    /** True while an activity is visible; run-finished notifications only fire when false. */
+    var foreground = true
+        set(v) { field = v; if (v) chat?.sessionId?.let { Notifier.clear(getApplication(), it) } }
+
     private fun setRunning(ids: List<String>) {
+        val finished = running.keys - ids.toSet()
         running.clear()
         ids.forEach { running[it] = true }
+        Notifier.working(getApplication(), ids.size)
+        if (!foreground) finished.forEach(::notifyFinished)
         val c = chat ?: return
         val now = c.sessionId?.let { running[it] } == true
         if (c.busy && !now) { c.busy = false; c.status = "" }
         if (!c.busy && now) c.busy = true
+    }
+
+    /** Post "done" for a session: its title plus the start of the agent's final reply. */
+    private fun notifyFinished(sid: String) = viewModelScope.launch {
+        val title = sessions.firstOrNull { it.id == sid }?.title ?: chat?.takeIf { it.sessionId == sid }?.title ?: "Pi"
+        val last = runCatching {
+            val msgs = chat?.takeIf { it.sessionId == sid }?.messages?.toList()
+                ?: call("sessions.get", buildJsonObject {
+                    put("id", sid); put("historyWindow", buildJsonObject { put("maxTurns", 1) })
+                }).obj("context").objs("messages")
+            val a = msgs.lastOrNull { it.str("role") == "assistant" }
+            a?.str("errorMessage")?.takeIf { it.isNotEmpty() }?.let { "Error: $it" }
+                ?: a?.objs("content")?.filter { it.str("type") == "text" }?.joinToString("\n") { it.str("text") }?.trim()
+        }.getOrNull()
+        Notifier.finished(getApplication(), sid, title, last?.take(400))
+    }
+
+    /** Opens a session by id (from a notification tap). */
+    fun openById(sid: String) {
+        Notifier.clear(getApplication(), sid)
+        if (chat?.sessionId == sid) return
+        val s = sessions.firstOrNull { it.id == sid } ?: Session(sid, "Session", "", 0, 0)
+        open(s)
     }
 
     fun rename(id: String, name: String) = launchSafe {
@@ -496,5 +526,5 @@ class AppState(app: Application) : AndroidViewModel(app) {
         return true
     }
 
-    override fun onCleared() { rpc?.close() }
+    override fun onCleared() { rpc?.close(); Notifier.working(getApplication(), 0) }
 }

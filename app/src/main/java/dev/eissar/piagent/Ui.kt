@@ -495,8 +495,9 @@ private fun textOf(m: JsonObject): String = when (val c = m["content"]) {
 private fun MessageItem(s: AppState, m: JsonObject, results: Map<String, JsonObject>, c: AppState.Chat) {
     val clip = LocalClipboardManager.current
     val copy = { clip.setText(AnnotatedString(textOf(m))); s.say("Copied") }
+    if (m.str("role") == "custom" && m.str("customType") == "compaction") return CompactionCard(m)
     when (m.str("role")) {
-        "user" -> Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.End) {
+        "user" -> parseSkill(textOf(m))?.let { SkillCard(it) } ?: Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.End) {
             Surface(
                 Modifier.widthIn(max = 320.dp).combinedClickable(onClick = {}, onLongClick = copy),
                 shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -505,7 +506,7 @@ private fun MessageItem(s: AppState, m: JsonObject, results: Map<String, JsonObj
                     m.str("queued").takeIf { it.isNotEmpty() }?.let {
                         Text(if (it == "steer") "Steer" else "Follow-up · queued", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
                     }
-                    Text(textOf(m))
+                    Text(linkify(textOf(m)))
                 }
             }
         }
@@ -525,7 +526,117 @@ private fun MessageItem(s: AppState, m: JsonObject, results: Map<String, JsonObj
         "bashExecution" -> CodeBlock("$ ${m.str("command")}\n${m.str("output")}")
         else -> Column(Modifier.padding(vertical = 4.dp)) {
             Muted(m.str("customType").ifEmpty { m.str("role") }.uppercase(), size = 11)
-            Text(textOf(m), fontSize = 14.sp)
+            Text(linkify(textOf(m)), fontSize = 14.sp)
+        }
+    }
+}
+
+// --- special message cards -----------------------------------------------------------
+
+/** A collapsible bordered card with a mono tag, a title and expandable content. */
+@Composable
+private fun FoldCard(tag: String, title: String, content: @Composable () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Surface(
+        Modifier.fillMaxWidth().padding(vertical = 6.dp), RoundedCornerShape(10.dp),
+        MaterialTheme.colorScheme.surfaceContainer,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column {
+            Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Muted(if (open) "▾" else "▸", size = 12)
+                Spacer(Modifier.width(6.dp))
+                Text(tag, fontFamily = Mono, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(8.dp))
+                Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (open) Column(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp)) { content() }
+        }
+    }
+}
+
+/** Compaction entries: summary body plus the <read-files>/<modified-files> lists Pi appends. */
+@Composable
+private fun CompactionCard(m: JsonObject) {
+    val (body, read, modified) = remember(m) { parseCompaction(textOf(m)) }
+    val before = m.obj("details").num("tokensBefore")
+    FoldCard("compaction", "Conversation compacted" + if (before > 0) " · ${tokens(before)} tokens before" else "") {
+        Muted("The history before this point was compacted into this summary:", size = 12, lines = 3)
+        Spacer(Modifier.height(6.dp))
+        if (body.isNotBlank()) SelectionContainer { ChatMarkdown(body) } else Muted("(no summary)")
+        FileList("Read", read)
+        FileList("Modified", modified)
+    }
+}
+
+@Composable
+private fun FileList(label: String, files: List<String>) {
+    if (files.isEmpty()) return
+    Spacer(Modifier.height(8.dp))
+    Muted("$label (${files.size})", size = 11)
+    files.forEach { Text(it, fontFamily = Mono, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+}
+
+private val FileSection = Regex("""<(read-files|modified-files)>\s*([\s\S]*?)\s*</\1>""")
+
+private fun parseCompaction(summary: String): Triple<String, List<String>, List<String>> {
+    val read = ArrayList<String>(); val modified = ArrayList<String>()
+    FileSection.findAll(summary).forEach { mr ->
+        val files = mr.groupValues[2].lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (mr.groupValues[1] == "read-files") read += files else modified += files
+    }
+    val body = FileSection.find(summary)?.let { summary.substring(0, it.range.first) } ?: summary
+    return Triple(body.trim(), read, modified)
+}
+
+/** Pi persists `/skill:name msg` as <skill name=".." location="..">content</skill>\n\nmsg. */
+private data class Skill(val name: String, val location: String, val content: String, val message: String?)
+
+private val SkillBlock = Regex("""^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n</skill>(?:\n\n([\s\S]+))?$""")
+
+private fun parseSkill(text: String): Skill? = SkillBlock.find(text)?.let {
+    Skill(it.groupValues[1], it.groupValues[2], it.groupValues[3], it.groupValues[4].trim().ifEmpty { null })
+}
+
+@Composable
+private fun SkillCard(k: Skill) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalAlignment = Alignment.End) {
+        // What the user actually typed, as a normal bubble…
+        Surface(Modifier.widthIn(max = 320.dp), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surfaceContainerHigh) {
+            Text(linkify("/skill:${k.name}" + (k.message?.let { " $it" } ?: "")), Modifier.padding(horizontal = 14.dp, vertical = 10.dp))
+        }
+        // …and the injected skill text folded away.
+        FoldCard("skill", k.name) {
+            Muted(k.location, size = 11, lines = 2)
+            Spacer(Modifier.height(6.dp))
+            SelectionContainer { ChatMarkdown(k.content) }
+        }
+    }
+}
+
+// --- links ---------------------------------------------------------------------------
+
+private val UrlRe = Regex("""https?://[^\s<>()\[\]"']+[^\s<>()\[\]"'.,;:!?]""")
+
+/** Plain text with tappable http(s) links (opened in the browser). */
+@Composable
+fun linkify(text: String): AnnotatedString {
+    val color = MaterialTheme.colorScheme.primary
+    return remember(text, color) {
+        androidx.compose.ui.text.buildAnnotatedString {
+            append(text)
+            UrlRe.findAll(text).forEach { mr ->
+                addLink(
+                    androidx.compose.ui.text.LinkAnnotation.Url(
+                        mr.value,
+                        androidx.compose.ui.text.TextLinkStyles(androidx.compose.ui.text.SpanStyle(
+                            color = color, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)),
+                    ),
+                    mr.range.first, mr.range.last + 1,
+                )
+            }
         }
     }
 }

@@ -62,6 +62,19 @@ fun ChatMarkdown(text: String, modifier: Modifier = Modifier) {
     )
 }
 
+/** The markdown lib marks links with string annotations it handles itself; plain Text needs LinkAnnotations. */
+@Composable
+private fun withLinks(a: androidx.compose.ui.text.AnnotatedString): androidx.compose.ui.text.AnnotatedString {
+    val urls = a.getStringAnnotations(com.mikepenz.markdown.utils.MARKDOWN_TAG_URL, 0, a.length)
+    if (urls.isEmpty()) return a
+    return androidx.compose.ui.text.buildAnnotatedString {
+        append(a)
+        urls.filter { it.item.startsWith("http") }.forEach {
+            addLink(androidx.compose.ui.text.LinkAnnotation.Url(it.item), it.start, it.end)
+        }
+    }
+}
+
 /**
  * Map a fence tag (```bash, ```ts, ```py …) to a Highlights SyntaxLanguage name;
  * the library itself only matches exact enum names like "SHELL" or "TYPESCRIPT".
@@ -109,7 +122,7 @@ private fun Table(content: String, node: ASTNode) {
                     val cell = cells.getOrNull(c)
                     val style = if (r == 0) Body.copy(fontWeight = FontWeight.SemiBold) else Body
                     Text(
-                        cell?.let { content.buildMarkdownAnnotatedString(it, style) } ?: androidx.compose.ui.text.AnnotatedString(""),
+                        cell?.let { withLinks(content.buildMarkdownAnnotatedString(it, style)) } ?: androidx.compose.ui.text.AnnotatedString(""),
                         Modifier.widthIn(max = 260.dp)
                             .background(if (r == 0) headerBg else Color.Transparent)
                             .padding(horizontal = 8.dp, vertical = 5.dp),
