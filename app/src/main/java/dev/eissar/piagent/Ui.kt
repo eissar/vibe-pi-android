@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -38,6 +39,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -235,6 +237,7 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
         }
     }
     // Follow the bottom while near it.
+    val scope = rememberCoroutineScope()
     val nearBottom by remember { derivedStateOf { !list.canScrollForward || list.layoutInfo.totalItemsCount == 0 } }
     LaunchedEffect(shown.size, shown.lastOrNull(), c.status) { if (nearBottom || c.loading) list.scrollToItem(shown.size) }
 
@@ -256,13 +259,23 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
         Column(Modifier.padding(pad)) {
             OfflineBar(s)
             if (c.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            LazyColumn(Modifier.weight(1f), list, contentPadding = PaddingValues(12.dp)) {
-                items(shown) { m -> MessageItem(s, m, results, c) }
-                item {
-                    if (c.busy) Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Muted(c.status.ifEmpty { "Working…" })
+            Box(Modifier.weight(1f)) {
+                LazyColumn(Modifier.fillMaxSize(), list, contentPadding = PaddingValues(12.dp)) {
+                    items(shown) { m -> MessageItem(s, m, results, c) }
+                    item {
+                        if (c.busy) Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Muted(c.status.ifEmpty { "Working…" })
+                        }
+                    }
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    !nearBottom, Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                    enter = androidx.compose.animation.fadeIn(), exit = androidx.compose.animation.fadeOut(),
+                ) {
+                    SmallFloatingActionButton({ scope.launch { list.animateScrollToItem(shown.size) } }) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "Scroll to bottom")
                     }
                 }
             }
