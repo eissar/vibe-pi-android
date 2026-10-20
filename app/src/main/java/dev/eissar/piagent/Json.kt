@@ -18,3 +18,4 @@ fun JsonObject?.obj(key: String): JsonObject? = this?.get(key) as? JsonObject
 fun JsonObject?.list(key: String): List<JsonElement> = (this?.get(key) as? JsonArray) ?: emptyList()
 fun JsonObject?.objs(key: String): List<JsonObject> = list(key).filterIsInstance<JsonObject>()
 fun JsonObject?.strs(key: String): List<String> = list(key).mapNotNull { it.string() }
+fun JsonObject?.numOrNull(key: String): Double? = (this?.get(key) as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull

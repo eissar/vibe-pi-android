@@ -246,15 +246,15 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
             TopAppBar(
                 navigationIcon = { IconButton(s::closeChat) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 title = {
-                    Column(Modifier.clickable { picking = true }) {
+                    Column {
                         Text(c.title, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Muted("${c.model?.name ?: "default model"} ▾  ${folder(c.cwd)}", size = 12)
+                        Muted(folder(c.cwd), size = 12)
                     }
                 },
                 actions = { IconButton(s::reload) { Icon(Icons.Filled.Refresh, "Reload") } },
             )
         },
-        bottomBar = { Composer(s, c) },
+        bottomBar = { Composer(s, c) { picking = true } },
     ) { pad ->
         Column(Modifier.padding(pad)) {
             OfflineBar(s)
@@ -285,10 +285,10 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
 }
 
 @Composable
-private fun Composer(s: AppState, c: AppState.Chat) {
+private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
         Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 8.dp, vertical = 6.dp)) {
-            ThinkingChip(s, c)
+            MetricsBar(s, c, pickModel)
             Row(verticalAlignment = Alignment.Bottom) {
                 OutlinedTextField(
                     c.draft, { c.draft = it }, Modifier.weight(1f), maxLines = 8,
@@ -319,17 +319,65 @@ private val LevelHints = mapOf(
     "medium" to "Balanced", "high" to "Deep reasoning", "xhigh" to "Maximum reasoning",
 )
 
+private val Warn = Color(0xFFFDD663)
+
+/**
+ * One fixed-height, horizontally scrolling row above the composer:
+ * model · [thinking] · context · session cost · last reply · queued · extension statuses.
+ * Items with no data are omitted; the row keeps its height either way.
+ */
+@Composable
+private fun MetricsBar(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
+    var sheet by remember { mutableStateOf<String?>(null) } // "cost" | "queued"
+    Row(
+        Modifier.fillMaxWidth().height(36.dp).horizontalScroll(rememberScrollState()),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        BarChip(c.model?.name ?: "default model", bold = true, onClick = pickModel)
+        ThinkingChip(s, c)
+        ContextChip(s, c)
+        if (c.total.cost > 0) BarChip(money(c.total.cost), onClick = { sheet = "cost" })
+        else if (c.total.input + c.total.output > 0) BarChip("${tokens(c.total.input + c.total.output)} tok", onClick = { sheet = "cost" })
+        c.lastReply?.let { u ->
+            val cost = if (u.cost > 0) " · ${money(u.cost)}" else ""
+            BarChip("last ↑${tokens(u.input + u.cacheRead + u.cacheWrite)} ↓${tokens(u.output)}$cost", onClick = { sheet = "cost" })
+        }
+        val q = c.queuedSteer.size + c.queuedFollowUp.size
+        if (q > 0) BarChip("$q queued", color = MaterialTheme.colorScheme.primary, onClick = { sheet = "queued" })
+        c.statuses.values.filter { it.isNotBlank() }.forEach { BarChip(it.lineSequence().first()) }
+    }
+    when (sheet) {
+        "cost" -> CostSheet(c) { sheet = null }
+        "queued" -> QueuedSheet(c) { sheet = null }
+    }
+}
+
+@Composable
+private fun BarChip(text: String, bold: Boolean = false, color: Color? = null, onClick: (() -> Unit)? = null) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.height(30.dp).let { if (onClick != null) it.clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick) else it },
+    ) {
+        Box(Modifier.padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
+            Text(
+                text, fontSize = 12.sp, maxLines = 1, softWrap = false,
+                fontWeight = if (bold) FontWeight.SemiBold else FontWeight.Normal,
+                color = color ?: MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** Shows the level as [low]; the picker only opens on tap. */
 @Composable
 private fun ThinkingChip(s: AppState, c: AppState.Chat) {
     val levels = s.levelsFor(c.model)
-    if (levels.size <= 1) return // model doesn't reason / nothing to choose
+    if (levels.size <= 1) return
     var open by remember { mutableStateOf(false) }
-    Box(Modifier.padding(bottom = 4.dp)) {
-        AssistChip(
-            onClick = { open = true },
-            label = { Text("Thinking: ${c.thinking.ifEmpty { "default" }} ▾", fontSize = 12.sp) },
-            modifier = Modifier.height(28.dp),
-        )
+    Box {
+        BarChip("[${c.thinking.ifEmpty { "default" }}]", onClick = { open = true })
         DropdownMenu(open, { open = false }) {
             levels.forEach { l ->
                 DropdownMenuItem(
@@ -345,6 +393,94 @@ private fun ThinkingChip(s: AppState, c: AppState.Chat) {
         }
     }
 }
+
+/** ctx 42% · 84k/200k, amber above 70%, red above 90%; tap for "Compact now". */
+@Composable
+private fun ContextChip(s: AppState, c: AppState.Chat) {
+    val u = c.context ?: return
+    if (u.window <= 0) return
+    var open by remember { mutableStateOf(false) }
+    val pct = u.percent ?: u.tokens?.let { it / u.window * 100 }
+    val color = when {
+        pct == null -> null
+        pct >= 90 -> MaterialTheme.colorScheme.error
+        pct >= 70 -> Warn
+        else -> null
+    }
+    val label = if (pct == null) "ctx ? / ${tokens(u.window)}"
+    else "ctx ${pct.toInt()}% · ${tokens(u.tokens ?: (pct / 100 * u.window))}/${tokens(u.window)}"
+    Box {
+        BarChip(if (c.compacting) "compacting…" else label, color = color, onClick = { open = true })
+        DropdownMenu(open, { open = false }) {
+            DropdownMenuItem(
+                text = { Text("Compact now") },
+                enabled = c.sessionId != null && !c.compacting && s.conn == Conn.Online,
+                onClick = { open = false; s.compact() },
+            )
+        }
+    }
+}
+
+@Composable
+private fun CostSheet(c: AppState.Chat, close: () -> Unit) {
+    ModalBottomSheet(close) {
+        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Session usage", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+            val t = c.total
+            StatRow("Cost", if (t.cost > 0) money(t.cost) else "—")
+            StatRow("Input", tokens(t.input))
+            StatRow("Output", tokens(t.output))
+            StatRow("Cache read", tokens(t.cacheRead))
+            StatRow("Cache write", tokens(t.cacheWrite))
+            val inAll = t.input + t.cacheRead
+            if (inAll > 0) StatRow("Cache hit", "${(t.cacheRead / inAll * 100).toInt()}%")
+            StatRow("Messages", "${c.userMessages} user · ${c.replies} assistant")
+            StatRow("Tool calls", "${c.toolCalls}")
+            c.context?.let { StatRow("Context window", tokens(it.window)) }
+            c.lastReply?.let { u ->
+                Spacer(Modifier.height(8.dp))
+                Text("Last reply", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                StatRow("Input", "${tokens(u.input)} (+${tokens(u.cacheRead)} cached)")
+                StatRow("Output", tokens(u.output))
+                if (u.cost > 0) StatRow("Cost", money(u.cost))
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatRow(label: String, value: String) = Row(Modifier.fillMaxWidth()) {
+    Muted(label, Modifier.weight(1f), size = 13)
+    Text(value, fontSize = 13.sp, fontFamily = Mono)
+}
+
+@Composable
+private fun QueuedSheet(c: AppState.Chat, close: () -> Unit) {
+    ModalBottomSheet(close) {
+        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Queued", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+            c.queuedSteer.forEach { QueuedRow("Steer", it) }
+            c.queuedFollowUp.forEach { QueuedRow("Follow-up", it) }
+        }
+    }
+}
+
+@Composable
+private fun QueuedRow(kind: String, text: String) = Column {
+    Text(kind, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+    Text(text, fontSize = 14.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
+}
+
+/** 950 · 12.3k · 1.2M */
+private fun tokens(n: Double): String = when {
+    n >= 1_000_000 -> "%.1fM".format(n / 1_000_000)
+    n >= 10_000 -> "%.0fk".format(n / 1000)
+    n >= 1000 -> "%.1fk".format(n / 1000)
+    else -> n.toInt().toString()
+}
+
+/** $1.24, or $0.042 below ten cents. */
+private fun money(usd: Double): String = if (usd < 0.10) "$%.3f".format(usd) else "$%.2f".format(usd)
 
 private fun isToolCall(b: JsonObject) = b.str("type") == "toolCall" || b.str("type") == "tool_use"
 

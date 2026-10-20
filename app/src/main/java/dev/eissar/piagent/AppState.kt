@@ -20,6 +20,17 @@ import kotlinx.serialization.json.put
 import java.time.Instant
 
 data class Session(val id: String, val title: String, val cwd: String, val modified: Long, val count: Int)
+/** Token counts; cost in USD. */
+data class Usage(val input: Double = 0.0, val output: Double = 0.0, val cacheRead: Double = 0.0, val cacheWrite: Double = 0.0, val cost: Double = 0.0) {
+    operator fun plus(o: Usage) = Usage(input + o.input, output + o.output, cacheRead + o.cacheRead, cacheWrite + o.cacheWrite, cost + o.cost)
+    companion object {
+        /** From an assistant message's `usage` object. */
+        fun of(u: JsonObject?): Usage? = u?.let {
+            Usage(it.num("input"), it.num("output"), it.num("cacheRead"), it.num("cacheWrite"), it.obj("cost").num("total"))
+        }
+    }
+}
+data class ContextUsage(val tokens: Double?, val window: Double, val percent: Double?)
 data class Model(val provider: String, val id: String, val name: String)
 /** An extension_ui_request awaiting the user's answer (select / confirm / input / editor). */
 data class Ask(val sessionId: String, val req: JsonObject) {
@@ -69,6 +80,19 @@ class AppState(app: Application) : AndroidViewModel(app) {
         var draft by mutableStateOf("")
         /** Current thinking level ("" = unknown / server default). */
         var thinking by mutableStateOf("")
+
+        // --- metrics bar ---
+        var context by mutableStateOf<ContextUsage?>(null)
+        var total by mutableStateOf(Usage())
+        var lastReply by mutableStateOf<Usage?>(null)
+        var replies by mutableStateOf(0)
+        var userMessages by mutableStateOf(0)
+        var toolCalls by mutableStateOf(0)
+        var queuedSteer by mutableStateOf(emptyList<String>())
+        var queuedFollowUp by mutableStateOf(emptyList<String>())
+        /** Extension status lines (setStatus), by key. */
+        val statuses = mutableStateMapOf<String, String>()
+        var compacting by mutableStateOf(false)
     }
 
     init {
@@ -224,6 +248,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
         chat = Chat(s.id, s.cwd, s.title)
         watch(s.id)
         reload()
+        refreshState()
     }
 
     fun newChat(cwd: String) {
@@ -251,6 +276,16 @@ class AppState(app: Application) : AndroidViewModel(app) {
                 r.obj("agentState").obj("state").str("thinkingLevel").takeIf { it.isNotEmpty() }?.let { c.thinking = it }
                 ctx.obj("model")?.let { c.model = findModel(it.str("provider"), it.str("modelId")) }
                 r.obj("info")?.str("name")?.takeIf { it.isNotBlank() }?.let { c.title = it }
+                r.obj("stats")?.let { st ->
+                    val t = st.obj("tokens")
+                    c.total = Usage(t.num("input"), t.num("output"), t.num("cacheRead"), t.num("cacheWrite"), st.num("cost"))
+                    c.replies = st.num("assistantMessages").toInt()
+                    c.userMessages = st.num("userMessages").toInt()
+                    c.toolCalls = st.num("toolCalls").toInt()
+                    st.obj("contextUsage")?.let { c.context = contextOf(it) }
+                }
+                c.lastReply = c.messages.lastOrNull { it.str("role") == "assistant" && it.obj("usage") != null }?.let { Usage.of(it.obj("usage")) }
+                applyState(c, r.obj("agentState").obj("state"))
                 val st = r.obj("agentState")
                 c.busy = running[sid] == true ||
                     (st.bool("running") && (st.obj("state").bool("isStreaming") || st.obj("state").bool("isPromptRunning")))
@@ -267,6 +302,52 @@ class AppState(app: Application) : AndroidViewModel(app) {
         if (sid == null) return
         unwatch = r.subscribe("agent.events", sid) { ev ->
             onMain { if (chat?.sessionId == sid) onAgentEvent(ev as? JsonObject ?: return@onMain) }
+        }
+    }
+
+    /** tokens / percent are null right after compaction, until the next reply. */
+    private fun contextOf(o: JsonObject) = ContextUsage(
+        tokens = o.numOrNull("tokens"), window = o.num("contextWindow"), percent = o.numOrNull("percent"),
+    )
+
+    /** Apply a get_state snapshot (context usage, queue, statuses, thinking level). */
+    private fun applyState(c: Chat, st: JsonObject?) {
+        st ?: return
+        st.obj("contextUsage")?.let { c.context = contextOf(it) }
+        st.obj("queuedMessages").let { q ->
+            c.queuedSteer = q.strs("steering"); c.queuedFollowUp = q.strs("followUp")
+        }
+        st.str("thinkingLevel").takeIf { it.isNotEmpty() }?.let { c.thinking = it }
+        c.compacting = st.bool("isCompacting")
+        if (st.containsKey("extensionStatuses")) {
+            c.statuses.clear()
+            st.objs("extensionStatuses").forEach { c.statuses[it.str("key")] = it.str("text") }
+        }
+    }
+
+    /** Re-read live agent state (context usage, queue). Cheap; called after turns and queue changes. */
+    private fun refreshState() {
+        val c = chat ?: return
+        val sid = c.sessionId ?: return
+        viewModelScope.launch {
+            runCatching {
+                val r = call("agent.state", buildJsonObject { put("sessionId", sid) })
+                if (chat === c) applyState(c, r.obj("state"))
+            }
+        }
+    }
+
+    fun compact() {
+        val c = chat ?: return
+        val sid = c.sessionId ?: return
+        c.compacting = true
+        c.status = "Compacting…"
+        launchSafe {
+            try { command(sid, buildJsonObject { put("type", "compact") }) } finally {
+                c.compacting = false
+                if (!c.busy) c.status = ""
+                reload()
+            }
         }
     }
 
@@ -310,6 +391,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
                         else -> { put("type", "prompt"); put("message", text); put("streamingBehavior", "followUp") }
                     }
                 })
+                if (wasBusy) refreshState()
             } catch (e: Exception) {
                 c.busy = false; c.status = ""; throw e
             }
@@ -342,10 +424,15 @@ class AppState(app: Application) : AndroidViewModel(app) {
                     "assistant" -> {
                         if (c.streaming in c.messages.indices) c.messages[c.streaming] = m else c.messages += m
                         c.streaming = -1
+                        Usage.of(m.obj("usage"))?.let { u -> c.lastReply = u; c.total += u }
+                        c.replies++
+                        c.toolCalls += m.objs("content").count { it.str("type") == "toolCall" || it.str("type") == "tool_use" }
                     }
                     "user" -> {
                         // Replace our optimistic bubble (matched by text, so queued ones resolve in order).
                         val text = (m["content"].string() ?: m.objs("content").firstOrNull { it.str("type") == "text" }.str("text")).trim()
+                        c.userMessages++
+                        if (c.queuedSteer.isNotEmpty() || c.queuedFollowUp.isNotEmpty()) refreshState()
                         val i = c.messages.indexOfFirst { it.bool("pending") && it.str("content").trim() == text }
                         when {
                             i < 0 -> c.messages += m
@@ -367,7 +454,8 @@ class AppState(app: Application) : AndroidViewModel(app) {
             "auto_compaction_start", "compaction_start" -> c.status = "Compacting…"
             "auto_compaction_end", "compaction_end" -> reload()
             "auto_retry_start" -> c.status = "Retrying…"
-            "agent_end", "prompt_done" -> { c.busy = false; c.status = "" }
+            "agent_end", "prompt_done" -> { c.busy = false; c.status = ""; refreshState() }
+            "turn_end" -> refreshState()
             "prompt_error" -> { c.busy = false; c.status = ""; say(ev.str("errorMessage").ifEmpty { ev.str("error") }) }
         }
     }
@@ -375,6 +463,10 @@ class AppState(app: Application) : AndroidViewModel(app) {
     private fun onExtensionUi(ev: JsonObject) {
         when (ev.str("method")) {
             "notify" -> say(ev.str("message"))
+            "setStatus" -> chat?.let { c ->
+                val text = ev.str("statusText")
+                if (text.isBlank()) c.statuses.remove(ev.str("statusKey")) else c.statuses[ev.str("statusKey")] = text
+            }
             "select", "confirm", "input", "editor" -> ask = Ask(chat?.sessionId ?: return, ev)
         }
     }
