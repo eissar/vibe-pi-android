@@ -7,3 +7,8 @@ fdroid/tmp/
 fdroid/archive/
 fdroid/unsigned/
 third_party/
+.gradle/
+local.properties
+app/build/
+.idea/
+*.iml
