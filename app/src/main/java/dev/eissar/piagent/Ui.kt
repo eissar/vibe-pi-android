@@ -287,20 +287,60 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
 @Composable
 private fun Composer(s: AppState, c: AppState.Chat) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
-        Row(Modifier.navigationBarsPadding().imePadding().padding(8.dp), verticalAlignment = Alignment.Bottom) {
-            OutlinedTextField(
-                c.draft, { c.draft = it }, Modifier.weight(1f), maxLines = 8,
-                placeholder = { Text(if (c.busy) "Queue a follow-up…" else "Message Pi…") },
-            )
-            Spacer(Modifier.width(6.dp))
-            if (c.busy && c.draft.isBlank()) {
-                FilledIconButton(s::stop, colors = IconButtonDefaults.filledIconButtonColors(MaterialTheme.colorScheme.error)) {
-                    Icon(Icons.Filled.Close, "Stop")
+        Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 8.dp, vertical = 6.dp)) {
+            ThinkingChip(s, c)
+            Row(verticalAlignment = Alignment.Bottom) {
+                OutlinedTextField(
+                    c.draft, { c.draft = it }, Modifier.weight(1f), maxLines = 8,
+                    placeholder = { Text(if (c.busy) "Steer now / queue follow-up…" else "Message Pi…") },
+                )
+                Spacer(Modifier.width(6.dp))
+                when {
+                    c.busy && c.draft.isBlank() ->
+                        FilledIconButton(s::stop, colors = IconButtonDefaults.filledIconButtonColors(MaterialTheme.colorScheme.error)) {
+                            Icon(Icons.Filled.Close, "Stop")
+                        }
+                    c.busy -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // Steer interrupts the current run; follow-up waits until it finishes.
+                        FilledTonalButton({ s.send(steer = true) }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Steer") }
+                        OutlinedButton({ s.send(steer = false) }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Follow-up") }
+                    }
+                    else -> FilledIconButton({ s.send() }, enabled = c.draft.isNotBlank() && s.conn == Conn.Online) {
+                        Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                    }
                 }
-            } else {
-                FilledIconButton(s::send, enabled = c.draft.isNotBlank() && s.conn == Conn.Online) {
-                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
-                }
+            }
+        }
+    }
+}
+
+private val LevelHints = mapOf(
+    "off" to "No reasoning", "minimal" to "Very brief reasoning", "low" to "Light reasoning",
+    "medium" to "Balanced", "high" to "Deep reasoning", "xhigh" to "Maximum reasoning",
+)
+
+@Composable
+private fun ThinkingChip(s: AppState, c: AppState.Chat) {
+    val levels = s.levelsFor(c.model)
+    if (levels.size <= 1) return // model doesn't reason / nothing to choose
+    var open by remember { mutableStateOf(false) }
+    Box(Modifier.padding(bottom = 4.dp)) {
+        AssistChip(
+            onClick = { open = true },
+            label = { Text("Thinking: ${c.thinking.ifEmpty { "default" }} ▾", fontSize = 12.sp) },
+            modifier = Modifier.height(28.dp),
+        )
+        DropdownMenu(open, { open = false }) {
+            levels.forEach { l ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(l, fontWeight = if (l == c.thinking) FontWeight.Bold else FontWeight.Normal)
+                            LevelHints[l]?.let { Muted(it, size = 11) }
+                        }
+                    },
+                    onClick = { s.setThinking(l); open = false },
+                )
             }
         }
     }
@@ -324,7 +364,14 @@ private fun MessageItem(s: AppState, m: JsonObject, results: Map<String, JsonObj
             Surface(
                 Modifier.widthIn(max = 320.dp).combinedClickable(onClick = {}, onLongClick = copy),
                 shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            ) { Text(textOf(m), Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) }
+            ) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    m.str("queued").takeIf { it.isNotEmpty() }?.let {
+                        Text(if (it == "steer") "Steer" else "Follow-up · queued", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                    }
+                    Text(textOf(m))
+                }
+            }
         }
         "assistant" -> Column(Modifier.fillMaxWidth().padding(vertical = 4.dp).combinedClickable(onClick = {}, onLongClick = copy)) {
             for (b in m.list("content").filterIsInstance<JsonObject>()) {

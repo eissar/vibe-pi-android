@@ -47,6 +47,9 @@ class AppState(app: Application) : AndroidViewModel(app) {
     var defaultCwd by mutableStateOf(""); private set
     val models = mutableStateListOf<Model>()
     private var defaultModel: Model? = null
+    /** Supported thinking levels per "provider:modelId". */
+    private val thinkingLevels = mutableStateMapOf<String, List<String>>()
+    fun levelsFor(m: Model?): List<String> = m?.let { thinkingLevels["${it.provider}:${it.id}"] }.orEmpty()
 
     // open chat (null = session list)
     var chat by mutableStateOf<Chat?>(null); private set
@@ -61,8 +64,11 @@ class AppState(app: Application) : AndroidViewModel(app) {
         var status by mutableStateOf("")
         /** Raw Pi agent messages, in order. The last one may be a streaming assistant message. */
         val messages = mutableStateListOf<JsonObject>()
-        var streaming = false
+        /** Index in [messages] of the assistant message currently streaming, or -1. */
+        var streaming = -1
         var draft by mutableStateOf("")
+        /** Current thinking level ("" = unknown / server default). */
+        var thinking by mutableStateOf("")
     }
 
     init {
@@ -194,6 +200,10 @@ class AppState(app: Application) : AndroidViewModel(app) {
         val r = call("models.list")
         models.clear()
         models += r.objs("models").map { Model(it.str("provider"), it.str("id"), it.str("name").ifEmpty { it.str("id") }) }
+        thinkingLevels.clear()
+        r.obj("thinkingLevels")?.forEach { (k, v) ->
+            thinkingLevels[k] = (v as? kotlinx.serialization.json.JsonArray)?.mapNotNull { it.string() }.orEmpty()
+        }
         defaultModel = r.obj("defaultModel")?.let { d -> findModel(d.str("provider"), d.str("modelId")) }
         chat?.let { if (it.model == null && it.sessionId == null) it.model = defaultModel }
     }
@@ -236,7 +246,9 @@ class AppState(app: Application) : AndroidViewModel(app) {
                 val ctx = r.obj("context")
                 c.messages.clear()
                 c.messages += ctx.objs("messages")
-                c.streaming = false
+                c.streaming = -1
+                ctx.str("thinkingLevel").takeIf { it.isNotEmpty() }?.let { c.thinking = it }
+                r.obj("agentState").obj("state").str("thinkingLevel").takeIf { it.isNotEmpty() }?.let { c.thinking = it }
                 ctx.obj("model")?.let { c.model = findModel(it.str("provider"), it.str("modelId")) }
                 r.obj("info")?.str("name")?.takeIf { it.isNotBlank() }?.let { c.title = it }
                 val st = r.obj("agentState")
@@ -261,7 +273,18 @@ class AppState(app: Application) : AndroidViewModel(app) {
     private suspend fun command(sid: String, cmd: JsonObject) =
         call("agent.command", buildJsonObject { put("sessionId", sid); put("command", cmd) })
 
-    fun send() {
+    fun setThinking(level: String) {
+        val c = chat ?: return
+        c.thinking = level
+        val sid = c.sessionId ?: return // new session: sent with agent.new
+        launchSafe { command(sid, buildJsonObject { put("type", "set_thinking_level"); put("level", level) }) }
+    }
+
+    /**
+     * Send the draft. While the agent is running, [steer] = true interrupts the current
+     * run with the message; false queues it as a follow-up for after the run.
+     */
+    fun send(steer: Boolean = true) {
         val c = chat ?: return
         val text = c.draft.trim()
         if (text.isEmpty()) return
@@ -269,16 +292,23 @@ class AppState(app: Application) : AndroidViewModel(app) {
         val wasBusy = c.busy
         c.busy = true
         if (c.status.isEmpty()) c.status = "Thinking…"
-        c.messages += buildJsonObject { put("role", "user"); put("content", text); put("pending", true) }
+        c.messages += buildJsonObject {
+            put("role", "user"); put("content", text); put("pending", true)
+            if (wasBusy) put("queued", if (steer) "steer" else "follow-up")
+        }
         launchSafe {
             try {
                 val sid = c.sessionId ?: call("agent.new", buildJsonObject {
                     put("cwd", c.cwd)
                     c.model?.let { put("provider", it.provider); put("modelId", it.id) }
+                    if (c.thinking.isNotEmpty()) put("thinkingLevel", c.thinking)
                 }).str("sessionId").also { c.sessionId = it; watch(it) }
                 command(sid, buildJsonObject {
-                    put("type", "prompt"); put("message", text)
-                    if (wasBusy) put("streamingBehavior", "followUp")
+                    when {
+                        !wasBusy -> { put("type", "prompt"); put("message", text) }
+                        steer -> { put("type", "steer"); put("message", text) }
+                        else -> { put("type", "prompt"); put("message", text); put("streamingBehavior", "followUp") }
+                    }
                 })
             } catch (e: Exception) {
                 c.busy = false; c.status = ""; throw e
@@ -302,20 +332,31 @@ class AppState(app: Application) : AndroidViewModel(app) {
             "message_start", "message_update" -> {
                 val m = ev.obj("message") ?: return
                 if (m.str("role") != "assistant") return
-                if (c.streaming && c.messages.isNotEmpty()) c.messages[c.messages.lastIndex] = m
-                else { c.messages += m; c.streaming = true }
+                if (c.streaming in c.messages.indices) c.messages[c.streaming] = m
+                else { c.messages += m; c.streaming = c.messages.lastIndex }
                 c.status = ""
             }
             "message_end" -> {
                 val m = ev.obj("message") ?: return
                 when (m.str("role")) {
                     "assistant" -> {
-                        if (c.streaming && c.messages.isNotEmpty()) c.messages[c.messages.lastIndex] = m else c.messages += m
-                        c.streaming = false
+                        if (c.streaming in c.messages.indices) c.messages[c.streaming] = m else c.messages += m
+                        c.streaming = -1
                     }
                     "user" -> {
-                        val i = c.messages.indexOfLast { it.bool("pending") }
-                        if (i >= 0) c.messages[i] = m else c.messages += m
+                        // Replace our optimistic bubble (matched by text, so queued ones resolve in order).
+                        val text = (m["content"].string() ?: m.objs("content").firstOrNull { it.str("type") == "text" }.str("text")).trim()
+                        val i = c.messages.indexOfFirst { it.bool("pending") && it.str("content").trim() == text }
+                        when {
+                            i < 0 -> c.messages += m
+                            // Delivered steer/follow-up: move it to where the agent actually received it.
+                            c.messages[i].str("queued").isNotEmpty() -> {
+                                c.messages.removeAt(i)
+                                if (c.streaming > i) c.streaming--
+                                c.messages += m
+                            }
+                            else -> c.messages[i] = m
+                        }
                     }
                     "system" -> {}
                     else -> c.messages += m
