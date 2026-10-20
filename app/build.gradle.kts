@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 val ksFile = file(System.getenv("KEYSTORE") ?: "${System.getProperty("user.home")}/.config/vibe-pi-android/release.keystore")
@@ -58,4 +59,7 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
     implementation(libs.markdown.m3)
+    implementation(libs.serialization.json)
+    implementation(libs.coroutines.android)
+    implementation(libs.lifecycle.runtime.compose)
 }

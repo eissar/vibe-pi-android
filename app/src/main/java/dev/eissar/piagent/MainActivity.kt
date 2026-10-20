@@ -8,26 +8,16 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 
 class MainActivity : ComponentActivity() {
-    private val vm: AppViewModel by viewModels()
+    private val state: AppState by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (!vm.back()) moveTaskToBack(true) // keep connection & state alive
-            }
+            override fun handleOnBackPressed() { if (!state.back()) moveTaskToBack(true) }
         })
-        setContent { PiTheme { App(vm) } }
+        setContent { PiTheme { Root(state) } }
     }
 
-    override fun onResume() {
-        super.onResume()
-        vm.onResume()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        vm.saveSettings()
-    }
+    override fun onResume() { super.onResume(); state.resume() }
 }

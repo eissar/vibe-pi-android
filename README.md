@@ -38,8 +38,7 @@ Needs JDK 17+ and the Android SDK (platform 34) in `~/Android/Sdk` (or `local.pr
 
 Release builds are signed with `~/.config/vibe-pi-android/release.keystore` if present, else `debug.keystore`.
 
-Source (`app/src/main/java/dev/eissar/piagent/`):
-- `Rpc.kt`: WebSocket RPC client (request/response, subscribe/event), address parsing
-- `Messages.kt`: Pi agent message JSON to the display model
-- `AppViewModel.kt`: app state, sessions, chat streaming, models, extension UI dialogs
-- `Screens.kt`: Compose UI (connect, sessions, new session, chat, model picker, dialogs)
+Source (`app/src/main/java/dev/eissar/piagent/`), written against the server's WebSocket API:
+- `Rpc.kt`: WebSocket RPC client (request/response, subscribe/event)
+- `AppState.kt`: connection, sessions, models, chat streaming, extension dialogs
+- `Ui.kt`: Compose screens
