@@ -22,8 +22,9 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mikepenz.markdown.compose.components.markdownComponents
-import com.mikepenz.markdown.compose.elements.MarkdownHighlightedCodeBlock
-import com.mikepenz.markdown.compose.elements.MarkdownHighlightedCodeFence
+import com.mikepenz.markdown.compose.elements.MarkdownCodeBlock
+import com.mikepenz.markdown.compose.elements.MarkdownCodeFence
+import com.mikepenz.markdown.compose.elements.MarkdownHighlightedCode
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownTypography
 import com.mikepenz.markdown.model.markdownPadding
@@ -54,11 +55,35 @@ fun ChatMarkdown(text: String, modifier: Modifier = Modifier) {
         ),
         padding = markdownPadding(block = 3.dp, list = 4.dp, listItemBottom = 2.dp),
         components = markdownComponents(
-            codeFence = { MarkdownHighlightedCodeFence(it.content, it.node, highlights) },
-            codeBlock = { MarkdownHighlightedCodeBlock(it.content, it.node, highlights) },
+            codeFence = { MarkdownCodeFence(it.content, it.node) { code, lang -> MarkdownHighlightedCode(code, languageName(lang), highlights) } },
+            codeBlock = { MarkdownCodeBlock(it.content, it.node) { code, lang -> MarkdownHighlightedCode(code, languageName(lang), highlights) } },
             table = { Table(it.content, it.node) },
         ),
     )
+}
+
+/**
+ * Map a fence tag (```bash, ```ts, ```py …) to a Highlights SyntaxLanguage name;
+ * the library itself only matches exact enum names like "SHELL" or "TYPESCRIPT".
+ */
+private fun languageName(tag: String?): String? {
+    val t = tag?.trim()?.lowercase()?.substringBefore(' ')?.takeIf { it.isNotEmpty() } ?: return null
+    return when (t) {
+        "sh", "bash", "zsh", "shell", "console", "shellscript", "fish", "ksh" -> "SHELL"
+        "js", "jsx", "javascript", "mjs", "cjs", "node", "json", "jsonc" -> "JAVASCRIPT"
+        "ts", "tsx", "typescript" -> "TYPESCRIPT"
+        "py", "python", "python3" -> "PYTHON"
+        "kt", "kts", "kotlin" -> "KOTLIN"
+        "rs", "rust" -> "RUST"
+        "rb", "ruby" -> "RUBY"
+        "cs", "csharp", "c#" -> "CSHARP"
+        "cpp", "c++", "cc", "cxx", "hpp", "h++" -> "CPP"
+        "c", "h" -> "C"
+        "go", "golang" -> "GO"
+        "pl", "perl" -> "PERL"
+        "coffee", "coffeescript" -> "COFFEESCRIPT"
+        else -> t.uppercase() // java, dart, swift, php, ... match directly
+    }
 }
 
 /**
