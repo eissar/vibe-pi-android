@@ -59,6 +59,7 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
     implementation(libs.markdown.m3)
+    implementation(libs.markdown.code)
     implementation(libs.serialization.json)
     implementation(libs.coroutines.android)
     implementation(libs.lifecycle.runtime.compose)

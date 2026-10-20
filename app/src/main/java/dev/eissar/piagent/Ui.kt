@@ -38,7 +38,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.mikepenz.markdown.m3.Markdown
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -53,6 +52,16 @@ fun PiTheme(content: @Composable () -> Unit) = MaterialTheme(
         primary = Color(0xFF8AB4F8), background = Color(0xFF111318), surface = Color(0xFF111318),
         surfaceContainer = Color(0xFF1A1D24), surfaceContainerHigh = Color(0xFF242832),
     ),
+    typography = Typography().let { t ->
+        t.copy(
+            titleLarge = t.titleLarge.copy(fontSize = 18.sp, lineHeight = 24.sp),
+            titleMedium = t.titleMedium.copy(fontSize = 15.sp, lineHeight = 20.sp),
+            bodyLarge = t.bodyLarge.copy(fontSize = 14.sp, lineHeight = 20.sp),
+            bodyMedium = t.bodyMedium.copy(fontSize = 13.sp, lineHeight = 18.sp),
+            bodySmall = t.bodySmall.copy(fontSize = 12.sp, lineHeight = 16.sp),
+            labelLarge = t.labelLarge.copy(fontSize = 13.sp),
+        )
+    },
     content = content,
 )
 
@@ -235,7 +244,7 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                 navigationIcon = { IconButton(s::closeChat) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 title = {
                     Column(Modifier.clickable { picking = true }) {
-                        Text(c.title, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(c.title, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Muted("${c.model?.name ?: "default model"} ▾  ${folder(c.cwd)}", size = 12)
                     }
                 },
@@ -308,7 +317,7 @@ private fun MessageItem(s: AppState, m: JsonObject, results: Map<String, JsonObj
             for (b in m.list("content").filterIsInstance<JsonObject>()) {
                 when {
                     b.str("type") == "text" && b.str("text").isNotBlank() ->
-                        SelectionContainer { Markdown(b.str("text"), modifier = Modifier.fillMaxWidth()) }
+                        SelectionContainer { ChatMarkdown(b.str("text")) }
                     b.str("type") == "thinking" && b.str("thinking").isNotBlank() -> Thinking(b.str("thinking"))
                     isToolCall(b) -> ToolCard(b.str("name"), b["arguments"] ?: b["input"], results[b.str("id")], c.busy)
                 }
