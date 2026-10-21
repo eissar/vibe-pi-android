@@ -22,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -251,7 +252,26 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                         Muted(folder(c.cwd), size = 12)
                     }
                 },
-                actions = { IconButton(s::reload) { Icon(Icons.Filled.Refresh, "Reload") } },
+                actions = {
+                    var menu by remember { mutableStateOf(false) }
+                    IconButton({ menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
+                    DropdownMenu(menu, { menu = false }) {
+                        val watched = s.isWatched(c.sessionId)
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text("Watch")
+                                    Muted("Persistent notification; ping on status change", size = 11, lines = 2)
+                                }
+                            },
+                            leadingIcon = { Checkbox(watched, null) },
+                            enabled = c.sessionId != null,
+                            onClick = { s.toggleWatch(); menu = false },
+                        )
+                        DropdownMenuItem({ Text("Reload") }, { s.reload(); menu = false },
+                            leadingIcon = { Icon(Icons.Filled.Refresh, null) })
+                    }
+                },
             )
         },
         bottomBar = { Composer(s, c) { picking = true } },

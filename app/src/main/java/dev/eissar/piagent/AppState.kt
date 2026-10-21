@@ -95,7 +95,28 @@ class AppState(app: Application) : AndroidViewModel(app) {
         var compacting by mutableStateOf(false)
     }
 
+    val watcher = Watcher(app, viewModelScope)
+    /** Bumped when the watch set changes, so Compose re-reads [isWatched]. */
+    var watchVersion by mutableStateOf(0); private set
+
+    fun isWatched(sid: String?): Boolean { watchVersion; return watcher.isWatched(sid) }
+
+    fun toggleWatch() {
+        val c = chat ?: return
+        val sid = c.sessionId ?: return say("Send a message first")
+        if (watcher.isWatched(sid)) watcher.remove(sid)
+        else {
+            watcher.add(sid, c.title, running[sid] == true)
+            watcher.subscribe(sid, rpc, ::onMain)
+        }
+        watchVersion++
+        Notifier.working(getApplication(), keepAliveCount())
+    }
+
+    private fun keepAliveCount() = (running.keys + watcher.ids).size
+
     init {
+        watcher.repostAll()
         if (prefs.getBoolean("online", false) && address.isNotBlank()) connect()
     }
 
@@ -135,6 +156,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
             retryDelay = 1000
             client.subscribe("agent.running", "*") { ev -> onMain { setRunning((ev as? JsonObject).strs("sessionIds")) } }
             client.subscribe("sessions.changed", "*") { onMain { refreshSoon() } }
+            watcher.attach(client, ::onMain)
             refreshSessions()
             launchSafe { defaultCwd = call("system.defaultCwd").str("cwd") }
             launchSafe { loadModels() }
@@ -194,6 +216,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
                 count = it.num("messageCount").toInt(),
             )
         }.sortedByDescending { it.modified }
+        sessions.forEach { if (watcher.isWatched(it.id)) watcher.setTitle(it.id, it.title) }
         setRunning(r.strs("runningSessionIds"))
     }
 
@@ -205,8 +228,10 @@ class AppState(app: Application) : AndroidViewModel(app) {
         val finished = running.keys - ids.toSet()
         running.clear()
         ids.forEach { running[it] = true }
-        Notifier.working(getApplication(), ids.size)
-        if (!foreground) finished.forEach(::notifyFinished)
+        watcher.onRunning(ids.toSet())
+        Notifier.working(getApplication(), keepAliveCount())
+        // Watched chats have their own notification; don't double up.
+        if (!foreground) finished.filterNot(watcher::isWatched).forEach(::notifyFinished)
         val c = chat ?: return
         val now = c.sessionId?.let { running[it] } == true
         if (c.busy && !now) { c.busy = false; c.status = "" }

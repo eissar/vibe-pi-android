@@ -26,6 +26,7 @@ object Notifier {
     const val EXTRA_SESSION = "session"
     private const val CH_DONE = "done"
     private const val CH_WORKING = "working"
+    private const val CH_WATCH = "watch"
     const val WORKING_ID = 1
 
     fun init(ctx: Context) {
@@ -33,6 +34,10 @@ object Notifier {
         nm.createNotificationChannel(
             NotificationChannel(CH_DONE, "Run finished", NotificationManager.IMPORTANCE_DEFAULT)
                 .apply { description = "When the agent finishes while Pi is in the background" }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CH_WATCH, "Watched chats", NotificationManager.IMPORTANCE_DEFAULT)
+                .apply { description = "Live status of chats you watch; pings when their state changes" }
         )
         nm.createNotificationChannel(
             NotificationChannel(CH_WORKING, "Agent working", NotificationManager.IMPORTANCE_MIN)
@@ -65,11 +70,40 @@ object Notifier {
         NotificationManagerCompat.from(ctx).notify(sessionId.hashCode(), n)
     }
 
+    private fun watchId(sid: String) = sid.hashCode() xor 0x5A5A5A5A
+
+    /** Persistent per-chat status notification; [ping] = audible, otherwise a silent update. */
+    fun watch(ctx: Context, sid: String, title: String, state: WatchState, detail: String, ping: Boolean) {
+        if (!canPost(ctx)) return
+        val icon = when (state) {
+            WatchState.Working -> android.R.drawable.stat_notify_sync
+            WatchState.NeedsInput -> android.R.drawable.stat_notify_more
+            WatchState.Error -> android.R.drawable.stat_notify_error
+            WatchState.Idle -> android.R.drawable.stat_notify_chat
+        }
+        val n = NotificationCompat.Builder(ctx, CH_WATCH)
+            .setSmallIcon(icon)
+            .setContentTitle(title.ifBlank { "Pi" })
+            .setSubText(state.label)
+            .setContentText(detail.ifBlank { state.label })
+            .setStyle(NotificationCompat.BigTextStyle().bigText(detail.ifBlank { state.label }))
+            .setContentIntent(openIntent(ctx, sid))
+            .setOngoing(true)
+            .setSilent(!ping)
+            .setOnlyAlertOnce(false)
+            .setGroup("watch")
+            .build()
+        NotificationManagerCompat.from(ctx).notify(watchId(sid), n)
+    }
+
+    fun unwatch(ctx: Context, sid: String) = NotificationManagerCompat.from(ctx).cancel(watchId(sid))
+
     fun clear(ctx: Context, sessionId: String) = NotificationManagerCompat.from(ctx).cancel(sessionId.hashCode())
 
     fun workingNotification(ctx: Context, count: Int) = NotificationCompat.Builder(ctx, CH_WORKING)
         .setSmallIcon(android.R.drawable.stat_notify_sync)
-        .setContentTitle(if (count == 1) "Pi is working" else "Pi is working on $count sessions")
+        .setContentTitle("Pi is connected")
+        .setContentText(if (count == 1) "1 active or watched chat" else "$count active or watched chats")
         .setContentIntent(openIntent(ctx, null))
         .setOngoing(true)
         .setSilent(true)
