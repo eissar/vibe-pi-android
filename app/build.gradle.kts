@@ -16,8 +16,8 @@ android {
         applicationId = "dev.eissar.piagent"
         minSdk = 29
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.9"
+        versionCode = 10
+        versionName = "0.10"
     }
 
     signingConfigs {

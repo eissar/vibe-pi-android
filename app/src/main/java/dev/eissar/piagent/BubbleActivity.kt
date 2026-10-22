@@ -26,7 +26,11 @@ class BubbleActivity : ComponentActivity() {
         })
         val sid = intent?.getStringExtra(Notifier.EXTRA_SESSION)
         if (sid != null) state.openById(sid)
-        setContent { PiTheme { BubbleRoot(state) } }
+        setContent {
+            androidx.compose.runtime.CompositionLocalProvider(LocalInBubble provides true) {
+                PiTheme { BubbleRoot(state) }
+            }
+        }
     }
 
     override fun onNewIntent(intent: android.content.Intent) {

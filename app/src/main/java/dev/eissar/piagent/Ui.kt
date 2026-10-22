@@ -68,6 +68,10 @@ fun PiTheme(content: @Composable () -> Unit) = MaterialTheme(
     content = content,
 )
 
+/** True while rendering inside a bubble window, where window insets are already partly
+ *  consumed by the floating window and combining system-bar + IME padding over-pads. */
+val LocalInBubble = androidx.compose.runtime.staticCompositionLocalOf { false }
+
 @Composable
 fun Root(s: AppState) {
     var settings by remember { mutableStateOf(s.address.isBlank()) }
@@ -108,7 +112,7 @@ fun BubbleRoot(s: AppState) {
         }
         s.notice?.let {
             Surface(
-                Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding().padding(12.dp),
+                Modifier.align(Alignment.BottomCenter).imePadding().padding(12.dp),
                 shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, shadowElevation = 4.dp,
             ) { Text(it, Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) }
         }
@@ -271,6 +275,7 @@ private fun NewSessionDialog(s: AppState, close: () -> Unit) {
 @Composable
 private fun ChatScreen(s: AppState, c: AppState.Chat) {
     var picking by remember { mutableStateOf(false) }
+    val inBubble = LocalInBubble.current
     val list = rememberLazyListState()
     // Results are shown inside their tool call card.
     val results = remember(c.messages.toList()) {
@@ -293,6 +298,7 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
     LaunchedEffect(shown.size, shown.lastOrNull(), c.status) { if (nearBottom || c.loading) list.scrollToItem(shown.size) }
 
     Scaffold(
+        contentWindowInsets = if (inBubble) WindowInsets(0) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(s::closeChat) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
@@ -374,7 +380,11 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
 @Composable
 private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
-        Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 8.dp, vertical = 6.dp)) {
+        val inBubble = LocalInBubble.current
+        Column(
+            (if (inBubble) Modifier.imePadding() else Modifier.navigationBarsPadding().imePadding())
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+        ) {
             MetricsBar(s, c, pickModel)
             Row(verticalAlignment = Alignment.Bottom) {
                 OutlinedTextField(
