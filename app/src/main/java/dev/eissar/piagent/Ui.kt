@@ -157,6 +157,14 @@ private fun ServerScreen(s: AppState, done: () -> Unit) {
                 }
             }
             s.connError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
+            HorizontalDivider()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Bubbles for watched chats")
+                    Muted("Watched chats also appear as floating bubbles", size = 11, lines = 2)
+                }
+                Switch(checked = s.bubblesForWatched(), onCheckedChange = s::setBubblesForWatched)
+            }
             Muted("Run the server with PI_WEBUI_HOST=0.0.0.0 npm start", lines = 3)
         }
     }
@@ -288,7 +296,7 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                             text = {
                                 Column {
                                     Text("Watch")
-                                    Muted("Persistent notification; ping on status change", size = 11, lines = 2)
+                                    Muted("Persistent notification + bubble; ping on status change", size = 11, lines = 2)
                                 }
                             },
                             leadingIcon = { Checkbox(watched, null) },
@@ -296,15 +304,20 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                             onClick = { s.toggleWatch(); menu = false },
                         )
                         val bubbled = c.sessionId?.let { s.isBubbled(it) } == true
+                        val autoBubble = s.isWatched(c.sessionId) && s.bubblesForWatched()
                         DropdownMenuItem(
                             text = {
                                 Column {
-                                    Text(if (bubbled) "Remove bubble" else "Show as bubble")
-                                    Muted("Keep this chat in a floating window", size = 11, lines = 2)
+                                    Text(if (bubbled && !autoBubble) "Remove bubble" else "Show as bubble")
+                                    Muted(
+                                        if (autoBubble) "Automatic for watched chats"
+                                        else "Keep this chat in a floating window",
+                                        size = 11, lines = 2,
+                                    )
                                 }
                             },
-                            leadingIcon = { Checkbox(bubbled, null) },
-                            enabled = c.sessionId != null,
+                            leadingIcon = { Checkbox(bubbled || autoBubble, null) },
+                            enabled = c.sessionId != null && !autoBubble,
                             onClick = { s.toggleBubble(); menu = false },
                         )
                         DropdownMenuItem({ Text("Reload") }, { s.reload(); menu = false },

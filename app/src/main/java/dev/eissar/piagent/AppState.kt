@@ -115,6 +115,20 @@ class AppState(val app: Application) {
         Notifier.working(app, keepAliveCount())
     }
 
+    /** Bumped when the bubble preference changes, so Compose re-reads it. */
+    var bubbleVersion by mutableStateOf(0); private set
+
+    /** Whether watched chats are shown as bubbles (user preference). */
+    fun bubblesForWatched(): Boolean { bubbleVersion; return watcher.bubblesOn() }
+
+    /** Toggle bubbles for watched chats (all currently watched chats update immediately). */
+    fun setBubblesForWatched(on: Boolean) {
+        watcher.setBubbles(on)
+        bubbleVersion++
+        if (on && !Notifier.bubblesEnabled(app))
+            say("Enable bubbles for Pi in system settings to see them")
+    }
+
     /** True when this session has a live bubble notification. */
     fun isBubbled(sid: String): Boolean = Notifier.isBubbled(app, sid)
 

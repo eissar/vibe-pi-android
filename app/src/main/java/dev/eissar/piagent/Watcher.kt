@@ -12,8 +12,9 @@ enum class WatchState(val label: String) { Idle("Idle"), Working("Working"), Nee
 
 /**
  * Watched chats: each gets a persistent notification showing its live status
- * (updated silently), and an audible ping when its [WatchState] changes and then
- * stays unchanged for [PING_DEBOUNCE_MS].
+ * (updated silently), a bubble (when bubbles are enabled for the app), and an
+ * audible ping when its [WatchState] changes and then stays unchanged for
+ * [PING_DEBOUNCE_MS].
  */
 class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
     private class Entry(val sid: String, var title: String) {
@@ -54,6 +55,7 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
         e.unsubscribe?.invoke()
         save()
         Notifier.unwatch(ctx, sid)
+        Notifier.unbubble(ctx, sid)
     }
 
     fun setTitle(sid: String, title: String) {
@@ -132,7 +134,24 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
         }
     }
 
-    private fun post(e: Entry, ping: Boolean) = Notifier.watch(ctx, e.sid, e.title, e.state, e.detail, ping)
+    /** Watched chats are also bubbled: one notification + bubble per chat, kept in sync here. */
+    private fun post(e: Entry, ping: Boolean) {
+        Notifier.watch(ctx, e.sid, e.title, e.state, e.detail, ping)
+        if (bubbles) Notifier.bubble(ctx, e.sid, e.title, e.detail.ifBlank { e.state.label }, ping)
+    }
+
+    /** User preference (system setting permitting): watched chats show as bubbles. */
+    private var bubbles = prefs.getBoolean("bubbleWatched", true) && Notifier.bubblesEnabled(ctx)
+
+    fun setBubbles(on: Boolean) {
+        bubbles = on && Notifier.bubblesEnabled(ctx)
+        prefs.edit().putBoolean("bubbleWatched", on).apply()
+        entries.values.forEach { e ->
+            if (bubbles) post(e, ping = false) else Notifier.unbubble(ctx, e.sid)
+        }
+    }
+
+    fun bubblesOn(): Boolean = bubbles
 
     /** Re-post all (e.g. after process restart) without pinging. */
     fun repostAll() = entries.values.forEach { post(it, ping = false) }
