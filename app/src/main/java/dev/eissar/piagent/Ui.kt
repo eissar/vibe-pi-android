@@ -137,6 +137,19 @@ private fun OfflineBar(s: AppState) {
 
 // --- server -----------------------------------------------------------------------
 
+/** "ws://host:port/path" -> ("host", "port"); tolerant of a bare host or a scheme. */
+private fun splitAddress(address: String): Pair<String, String> {
+    val a = address.trim()
+        .removePrefix("wss://").removePrefix("ws://").removePrefix("https://").removePrefix("http://")
+        .substringBefore('/')
+    val colon = a.lastIndexOf(':')
+    return if (colon > 0 && a.indexOf(']') < colon) a.substring(0, colon) to a.substring(colon + 1)
+    else a to "7860"
+}
+
+private fun joinAddress(host: String, port: String): String =
+    if (port.isBlank()) host else "$host:${port.trim()}"
+
 @Composable
 private fun ServerScreen(s: AppState, done: () -> Unit) {
     // Close only when a connection attempt *succeeds* while this screen is open; opening the
@@ -154,11 +167,27 @@ private fun ServerScreen(s: AppState, done: () -> Unit) {
         )
     }) { pad ->
         Column(Modifier.padding(pad).padding(20.dp).imePadding(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(
-                s.address, { s.address = it }, Modifier.fillMaxWidth(), singleLine = true,
-                label = { Text("Address") }, placeholder = { Text("192.168.1.10:7860") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            )
+            // Host and port are edited separately but stored in the single "host:port" address,
+            // so everything downstream (resolveRpcUrl, prefs) is unchanged.
+            var host by remember { mutableStateOf(splitAddress(s.address).first) }
+            var port by remember { mutableStateOf(splitAddress(s.address).second) }
+            fun push() { s.address = joinAddress(host.trim(), port.trim()) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    host,
+                    { host = it; push() },
+                    Modifier.weight(2f), singleLine = true,
+                    label = { Text("Host") }, placeholder = { Text("192.168.1.10") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                )
+                OutlinedTextField(
+                    port,
+                    { port = it.filter(Char::isDigit); push() },
+                    Modifier.weight(1f), singleLine = true,
+                    label = { Text("Port") }, placeholder = { Text("7860") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+            }
             OutlinedTextField(
                 s.token, { s.token = it }, Modifier.fillMaxWidth(), singleLine = true,
                 label = { Text("Token (optional)") }, visualTransformation = PasswordVisualTransformation(),
