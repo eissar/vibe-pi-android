@@ -292,10 +292,19 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
             else -> true
         }
     }
-    // Follow the bottom while near it.
+    // Follow the bottom while near it, and always start at the bottom when the chat opens:
+    // the history arrives after first composition, when nothing is laid out yet, so a plain
+    // "is the list near the bottom" test can't see the content that is about to be added.
     val scope = rememberCoroutineScope()
     val nearBottom by remember { derivedStateOf { !list.canScrollForward || list.layoutInfo.totalItemsCount == 0 } }
-    LaunchedEffect(shown.size, shown.lastOrNull(), c.status) { if (nearBottom || c.loading) list.scrollToItem(shown.size) }
+    var landed by remember(c.sessionId) { mutableStateOf(false) }
+    LaunchedEffect(shown.size, shown.lastOrNull(), c.status, c.loading) {
+        if (shown.isEmpty()) return@LaunchedEffect
+        if (!landed || nearBottom || c.loading) {
+            list.scrollToItem(shown.lastIndex)
+            landed = true
+        }
+    }
 
     Scaffold(
         contentWindowInsets = if (inBubble) WindowInsets(0) else ScaffoldDefaults.contentWindowInsets,
@@ -367,7 +376,7 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                     !nearBottom, Modifier.align(Alignment.BottomEnd).padding(12.dp),
                     enter = androidx.compose.animation.fadeIn(), exit = androidx.compose.animation.fadeOut(),
                 ) {
-                    SmallFloatingActionButton({ scope.launch { list.animateScrollToItem(shown.size) } }) {
+                    SmallFloatingActionButton({ scope.launch { list.animateScrollToItem(shown.lastIndex.coerceAtLeast(0)) } }) {
                         Icon(Icons.Filled.KeyboardArrowDown, "Scroll to bottom")
                     }
                 }
