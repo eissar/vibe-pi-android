@@ -4,7 +4,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 
 /**
  * Hosts a chat in a floating bubble window. Shares [AppGraph]'s single [AppState]
@@ -19,7 +18,10 @@ class BubbleActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // A bubble window is resized by the IME (SOFT_INPUT_ADJUST_RESIZE), so the content is
+        // already lifted; padding by ime() on top of that would push the composer up twice.
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         Notifier.init(this)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { finish() }

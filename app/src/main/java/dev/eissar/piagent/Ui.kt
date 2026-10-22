@@ -391,6 +391,9 @@ private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
         val inBubble = LocalInBubble.current
         Column(
+            // A bubble window is resized so the keyboard can't occlude it: ime() then reports
+            // the (zero) overlap and is harmless, but navigationBars() is real extra padding —
+            // that was the gap above the keyboard.
             (if (inBubble) Modifier.imePadding() else Modifier.navigationBarsPadding().imePadding())
                 .padding(horizontal = 8.dp, vertical = 6.dp)
         ) {
