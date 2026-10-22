@@ -129,12 +129,17 @@ object Notifier {
 
     private fun shortcutId(sid: String) = "chat_$sid"
 
+    // Push a shortcut once per (session, title): dynamic shortcuts are rate limited by the
+    // system, and a re-push on every status update would start failing on Android 16.
+    private val pushedShortcuts = HashMap<String, String>()
+
     private fun bubbleIntent(ctx: Context, sid: String): PendingIntent {
         val i = Intent(ctx, BubbleActivity::class.java)
             .putExtra(EXTRA_SESSION, sid)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        // Mutable: the system may decorate the bubble's launch intent (required on 12+).
         return PendingIntent.getActivity(
-            ctx, shortcutId(sid).hashCode(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            ctx, shortcutId(sid).hashCode(), i, PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
     }
 
@@ -142,7 +147,8 @@ object Notifier {
      * Publishes (or refreshes) the conversation shortcut a bubble needs on Android 11+.
      * Long-lived so it survives reboots, matching the persistent watch notification.
      */
-    private fun publishShortcut(ctx: Context, sid: String, title: String) {
+    /** Pushes the conversation shortcut; returns false when the system refused it. */
+    private fun publishShortcut(ctx: Context, sid: String, title: String): Boolean {
         val person = Person.Builder().setName(title.ifBlank { "Pi" }).setKey(sid).setImportant(true).build()
         val info = ShortcutInfoCompat.Builder(ctx, shortcutId(sid))
             .setShortLabel(title.ifBlank { "Pi" })
@@ -152,7 +158,7 @@ object Notifier {
             .setLongLived(true)
             .setIntent(Intent(ctx, BubbleActivity::class.java).putExtra(EXTRA_SESSION, sid).setAction(Intent.ACTION_VIEW))
             .build()
-        runCatching { ShortcutManagerCompat.pushDynamicShortcut(ctx, info) }
+        return runCatching { ShortcutManagerCompat.pushDynamicShortcut(ctx, info) }.getOrNull() != null
     }
 
     /**
@@ -161,7 +167,12 @@ object Notifier {
      */
     fun bubble(ctx: Context, sid: String, title: String, detail: String, ping: Boolean) {
         if (!canPost(ctx)) return
-        publishShortcut(ctx, sid, title)
+        // Android 11+ (stricter still on 16) only bubbles a notification whose shortcut is
+        // resolvable, so publish first and skip the bubble if the system refused it.
+        val already = pushedShortcuts[sid] == title
+        val shortcutOk = already || publishShortcut(ctx, sid, title) ||
+            runCatching { ShortcutManagerCompat.getShortcuts(ctx, ShortcutManagerCompat.FLAG_MATCH_DYNAMIC) }
+                .getOrNull()?.any { it.id == shortcutId(sid) } == true
         val bubble = NotificationCompat.BubbleMetadata.Builder(bubbleIntent(ctx, sid), IconCompat.createWithResource(ctx, R.mipmap.ic_launcher))
             .setDesiredHeight(600)
             .setAutoExpandBubble(false)
@@ -173,7 +184,7 @@ object Notifier {
             .setContentTitle(title.ifBlank { "Pi" })
             .setContentText(detail.ifBlank { "Pi" })
             .setContentIntent(bubbleIntent(ctx, sid))
-            .setBubbleMetadata(bubble)
+            .apply { if (shortcutOk) setBubbleMetadata(bubble) }
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setShortcutId(shortcutId(sid))
             .addPerson(person)
@@ -184,12 +195,14 @@ object Notifier {
             .setAutoCancel(false)
             .setOngoing(true)
             .build()
+        if (shortcutOk) pushedShortcuts[sid] = title
         NotificationManagerCompat.from(ctx).notify(bubbleId(sid), n)
     }
 
     private fun bubbleId(sid: String) = sid.hashCode() xor 0x3C3C3C3C
 
     fun unbubble(ctx: Context, sid: String) {
+        pushedShortcuts.remove(sid)
         NotificationManagerCompat.from(ctx).cancel(bubbleId(sid))
         runCatching { ShortcutManagerCompat.removeDynamicShortcuts(ctx, listOf(shortcutId(sid))) }
     }
@@ -203,20 +216,28 @@ object Notifier {
     fun notificationsEnabled(ctx: Context): Boolean =
         NotificationManagerCompat.from(ctx).areNotificationsEnabled()
 
-    /** Opens this app's "Chats" channel settings, where the user can allow bubbles. */
+    /**
+     * Opens the system page where bubbles are actually toggled for this app.
+     *
+     * Android 11+ (and Android 16 especially) keeps the per-app bubble switch in system
+     * settings; channel-level allowBubbles is advisory only, and there is no runtime
+     * permission to request. ACTION_APP_NOTIFICATION_BUBBLE_SETTINGS is the precise page;
+     * fall back to the app's notification settings, then the channel.
+     */
     fun openBubbleSettings(ctx: Context) {
-        val i = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-            .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
-            .putExtra(Settings.EXTRA_CHANNEL_ID, CH_BUBBLE)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        runCatching { ctx.startActivity(i) }
-            .recoverCatching {
-                ctx.startActivity(
-                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                        .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
+        val candidates = listOf(
+            Intent(Settings.ACTION_APP_NOTIFICATION_BUBBLE_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName),
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName),
+            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                .putExtra(Settings.EXTRA_CHANNEL_ID, CH_BUBBLE),
+        )
+        for (i in candidates) {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { ctx.startActivity(i) }.isSuccess) return
+        }
     }
 
     fun isBubbled(ctx: Context, sid: String): Boolean =
