@@ -415,6 +415,9 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
     if (picking) ModelSheet(s, c) { picking = false }
 }
 
+/** Matches the composer field's single-line height so the button row can't inflate it. */
+private val ComposerButtonHeight = 44.dp
+
 @Composable
 private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
@@ -438,10 +441,20 @@ private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
                         FilledIconButton(s::stop, colors = IconButtonDefaults.filledIconButtonColors(MaterialTheme.colorScheme.error)) {
                             Icon(Icons.Filled.Close, "Stop")
                         }
-                    c.busy -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        // Steer interrupts the current run; follow-up waits until it finishes.
-                        FilledTonalButton({ s.send(steer = true) }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Steer") }
-                        OutlinedButton({ s.send(steer = false) }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Follow-up") }
+                    // Steer interrupts the current run; follow-up waits until it finishes.
+                    // Side by side and only as tall as one line of the field, so the busy
+                    // composer never grows taller than the empty one.
+                    c.busy -> Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        FilledTonalButton(
+                            { s.send(steer = true) },
+                            Modifier.height(ComposerButtonHeight),
+                            contentPadding = PaddingValues(horizontal = 10.dp),
+                        ) { Text("Steer", fontSize = 12.sp, maxLines = 1) }
+                        OutlinedButton(
+                            { s.send(steer = false) },
+                            Modifier.height(ComposerButtonHeight),
+                            contentPadding = PaddingValues(horizontal = 10.dp),
+                        ) { Text("Queue", fontSize = 12.sp, maxLines = 1) }
                     }
                     else -> FilledIconButton({ s.send() }, enabled = c.draft.isNotBlank() && s.conn == Conn.Online) {
                         Icon(Icons.AutoMirrored.Filled.Send, "Send")
