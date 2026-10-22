@@ -7,8 +7,6 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,7 +38,11 @@ data class Ask(val sessionId: String, val req: JsonObject) {
 
 enum class Conn { Offline, Connecting, Online }
 
-class AppState(app: Application) : AndroidViewModel(app) {
+class AppState(val app: Application) {
+    /** Process-wide scope: the state can outlive (and be shared by) activities, e.g. bubbled chats. */
+    val viewModelScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+    )
     private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private var rpc: PiRpc? = null
     private var wantOnline = false
@@ -110,8 +112,35 @@ class AppState(app: Application) : AndroidViewModel(app) {
             watcher.subscribe(sid, rpc, ::onMain)
         }
         watchVersion++
-        Notifier.working(getApplication(), keepAliveCount())
+        Notifier.working(app, keepAliveCount())
     }
+
+    /** True when this session has a live bubble notification. */
+    fun isBubbled(sid: String): Boolean = Notifier.isBubbled(app, sid)
+
+    /** Show/hide the open chat as a floating bubble. */
+    fun toggleBubble() {
+        val c = chat ?: return
+        val sid = c.sessionId ?: return say("Send a message first")
+        if (Notifier.isBubbled(app, sid)) Notifier.unbubble(app, sid)
+        else {
+            Notifier.bubble(app, sid, c.title, lastAssistantText(c).ifBlank { c.status }, ping = false)
+            if (!Notifier.bubblesEnabled(app))
+                say("Bubble posted — enable bubbles for Pi in system settings if it doesn't appear")
+        }
+    }
+
+    /** Keep an existing bubble's text in sync as messages stream in. */
+    private fun refreshBubble(c: Chat) {
+        val sid = c.sessionId ?: return
+        if (!Notifier.isBubbled(app, sid)) return
+        Notifier.bubble(app, sid, c.title, lastAssistantText(c).ifBlank { c.status }, ping = false)
+    }
+
+    private fun lastAssistantText(c: Chat): String =
+        c.messages.lastOrNull { it.str("role") == "assistant" }?.let { m ->
+            m.objs("content").filter { it.str("type") == "text" }.joinToString("\n") { it.str("text") }
+        }?.take(400).orEmpty()
 
     private fun keepAliveCount() = (running.keys + watcher.ids).size
 
@@ -222,14 +251,14 @@ class AppState(app: Application) : AndroidViewModel(app) {
 
     /** True while an activity is visible; run-finished notifications only fire when false. */
     var foreground = true
-        set(v) { field = v; if (v) chat?.sessionId?.let { Notifier.clear(getApplication(), it) } }
+        set(v) { field = v; if (v) chat?.sessionId?.let { Notifier.clear(app, it) } }
 
     private fun setRunning(ids: List<String>) {
         val finished = running.keys - ids.toSet()
         running.clear()
         ids.forEach { running[it] = true }
         watcher.onRunning(ids.toSet())
-        Notifier.working(getApplication(), keepAliveCount())
+        Notifier.working(app, keepAliveCount())
         // Watched chats have their own notification; don't double up.
         if (!foreground) finished.filterNot(watcher::isWatched).forEach(::notifyFinished)
         val c = chat ?: return
@@ -250,12 +279,12 @@ class AppState(app: Application) : AndroidViewModel(app) {
             a?.str("errorMessage")?.takeIf { it.isNotEmpty() }?.let { "Error: $it" }
                 ?: a?.objs("content")?.filter { it.str("type") == "text" }?.joinToString("\n") { it.str("text") }?.trim()
         }.getOrNull()
-        Notifier.finished(getApplication(), sid, title, last?.take(400))
+        Notifier.finished(app, sid, title, last?.take(400))
     }
 
     /** Opens a session by id (from a notification tap). */
     fun openById(sid: String) {
-        Notifier.clear(getApplication(), sid)
+        Notifier.clear(app, sid)
         if (chat?.sessionId == sid) return
         val s = sessions.firstOrNull { it.id == sid } ?: Session(sid, "Session", "", 0, 0)
         open(s)
@@ -472,6 +501,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
                 if (c.streaming in c.messages.indices) c.messages[c.streaming] = m
                 else { c.messages += m; c.streaming = c.messages.lastIndex }
                 c.status = ""
+                refreshBubble(c)
             }
             "message_end" -> {
                 val m = ev.obj("message") ?: return
@@ -482,6 +512,7 @@ class AppState(app: Application) : AndroidViewModel(app) {
                         Usage.of(m.obj("usage"))?.let { u -> c.lastReply = u; c.total += u }
                         c.replies++
                         c.toolCalls += m.objs("content").count { it.str("type") == "toolCall" || it.str("type") == "tool_use" }
+                        refreshBubble(c)
                     }
                     "user" -> {
                         // Replace our optimistic bubble (matched by text, so queued ones resolve in order).
@@ -551,5 +582,5 @@ class AppState(app: Application) : AndroidViewModel(app) {
         return true
     }
 
-    override fun onCleared() { rpc?.close(); Notifier.working(getApplication(), 0) }
+    fun dispose() { rpc?.close(); Notifier.working(app, 0) }
 }

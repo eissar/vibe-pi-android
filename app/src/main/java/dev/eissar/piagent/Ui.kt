@@ -88,6 +88,33 @@ fun Root(s: AppState) {
     }
 }
 
+/**
+ * Content of a bubbled chat window: the chat itself, or a short prompt when no
+ * session is open (e.g. the bubble outlived its session).
+ */
+@Composable
+fun BubbleRoot(s: AppState) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        val chat = s.chat
+        if (chat != null) ChatScreen(s, chat) else Surface(Modifier.fillMaxSize()) {
+            Column(
+                Modifier.fillMaxSize().padding(20.dp).imePadding(),
+                verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Muted("No chat open", size = 14)
+                Spacer(Modifier.height(12.dp))
+                Muted("Open a chat in Pi, then ⋮ → Show as bubble", size = 12, lines = 2)
+            }
+        }
+        s.notice?.let {
+            Surface(
+                Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding().padding(12.dp),
+                shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, shadowElevation = 4.dp,
+            ) { Text(it, Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) }
+        }
+    }
+}
+
 @Composable
 private fun Muted(text: String, modifier: Modifier = Modifier, size: Int = 13, lines: Int = 1) = Text(
     text, modifier, fontSize = size.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -267,6 +294,18 @@ private fun ChatScreen(s: AppState, c: AppState.Chat) {
                             leadingIcon = { Checkbox(watched, null) },
                             enabled = c.sessionId != null,
                             onClick = { s.toggleWatch(); menu = false },
+                        )
+                        val bubbled = c.sessionId?.let { s.isBubbled(it) } == true
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(if (bubbled) "Remove bubble" else "Show as bubble")
+                                    Muted("Keep this chat in a floating window", size = 11, lines = 2)
+                                }
+                            },
+                            leadingIcon = { Checkbox(bubbled, null) },
+                            enabled = c.sessionId != null,
+                            onClick = { s.toggleBubble(); menu = false },
                         )
                         DropdownMenuItem({ Text("Reload") }, { s.reload(); menu = false },
                             leadingIcon = { Icon(Icons.Filled.Refresh, null) })

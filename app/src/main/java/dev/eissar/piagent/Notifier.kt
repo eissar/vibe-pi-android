@@ -13,8 +13,12 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 
 /**
  * Run notifications:
@@ -24,7 +28,9 @@ import androidx.core.content.ContextCompat
  */
 object Notifier {
     const val EXTRA_SESSION = "session"
+    const val EXTRA_BUBBLE = "bubble"
     private const val CH_DONE = "done"
+    private const val CH_BUBBLE = "chat"
     private const val CH_WORKING = "working"
     private const val CH_WATCH = "watch"
     const val WORKING_ID = 1
@@ -38,6 +44,10 @@ object Notifier {
         nm.createNotificationChannel(
             NotificationChannel(CH_WATCH, "Watched chats", NotificationManager.IMPORTANCE_DEFAULT)
                 .apply { description = "Live status of chats you watch; pings when their state changes" }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CH_BUBBLE, "Chats", NotificationManager.IMPORTANCE_HIGH)
+                .apply { description = "Chat notifications that can be shown as bubbles"; setShowBadge(true) }
         )
         nm.createNotificationChannel(
             NotificationChannel(CH_WORKING, "Agent working", NotificationManager.IMPORTANCE_MIN)
@@ -108,6 +118,83 @@ object Notifier {
         .setOngoing(true)
         .setSilent(true)
         .build()
+
+
+    // --- bubbles -------------------------------------------------------------------
+
+    private fun shortcutId(sid: String) = "chat_$sid"
+
+    private fun bubbleIntent(ctx: Context, sid: String): PendingIntent {
+        val i = Intent(ctx, BubbleActivity::class.java)
+            .putExtra(EXTRA_SESSION, sid)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        return PendingIntent.getActivity(
+            ctx, shortcutId(sid).hashCode(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
+
+    /**
+     * Publishes (or refreshes) the conversation shortcut a bubble needs on Android 11+.
+     * Long-lived so it survives reboots, matching the persistent watch notification.
+     */
+    private fun publishShortcut(ctx: Context, sid: String, title: String) {
+        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setImportant(true).build()
+        val info = ShortcutInfoCompat.Builder(ctx, shortcutId(sid))
+            .setShortLabel(title.ifBlank { "Pi" })
+            .setLongLabel(title.ifBlank { "Pi" })
+            .setIcon(IconCompat.createWithResource(ctx, android.R.drawable.stat_notify_chat))
+            .setPerson(person)
+            .setLongLived(true)
+            .setIntent(Intent(ctx, BubbleActivity::class.java).putExtra(EXTRA_SESSION, sid).setAction(Intent.ACTION_VIEW))
+            .build()
+        runCatching { ShortcutManagerCompat.pushDynamicShortcut(ctx, info) }
+    }
+
+    /**
+     * Posts/updates the chat as a bubble. The notification itself is silent and grouped;
+     * tapping the bubble opens [BubbleActivity] in a floating window.
+     */
+    fun bubble(ctx: Context, sid: String, title: String, detail: String, ping: Boolean) {
+        if (!canPost(ctx)) return
+        publishShortcut(ctx, sid, title)
+        val bubble = NotificationCompat.BubbleMetadata.Builder(bubbleIntent(ctx, sid), IconCompat.createWithResource(ctx, R.mipmap.ic_launcher))
+            .setDesiredHeight(600)
+            .setAutoExpandBubble(false)
+            .setSuppressNotification(false)
+            .build()
+        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setImportant(true).build()
+        val n = NotificationCompat.Builder(ctx, CH_BUBBLE)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle(title.ifBlank { "Pi" })
+            .setContentText(detail.ifBlank { "Pi" })
+            .setContentIntent(bubbleIntent(ctx, sid))
+            .setBubbleMetadata(bubble)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setShortcutId(shortcutId(sid))
+            .addPerson(person)
+            .setStyle(NotificationCompat.MessagingStyle(person)
+                .setConversationTitle(title.ifBlank { "Pi" })
+                .addMessage(detail.ifBlank { "Pi" }, System.currentTimeMillis(), person))
+            .setSilent(!ping)
+            .setAutoCancel(false)
+            .setOngoing(true)
+            .build()
+        NotificationManagerCompat.from(ctx).notify(bubbleId(sid), n)
+    }
+
+    private fun bubbleId(sid: String) = sid.hashCode() xor 0x3C3C3C3C
+
+    fun unbubble(ctx: Context, sid: String) {
+        NotificationManagerCompat.from(ctx).cancel(bubbleId(sid))
+        runCatching { ShortcutManagerCompat.removeDynamicShortcuts(ctx, listOf(shortcutId(sid))) }
+    }
+
+    /** False when the user turned bubbles off for the app in system settings. */
+    fun bubblesEnabled(ctx: Context): Boolean =
+        ctx.getSystemService(NotificationManager::class.java).areBubblesAllowed()
+
+    fun isBubbled(ctx: Context, sid: String): Boolean =
+        NotificationManagerCompat.from(ctx).activeNotifications.any { it.id == bubbleId(sid) }
 
     /** Start/update/stop the keep-alive service for [count] running sessions. */
     fun working(ctx: Context, count: Int) {

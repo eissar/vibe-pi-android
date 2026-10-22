@@ -9,10 +9,9 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 
 class MainActivity : ComponentActivity() {
-    private val state: AppState by viewModels()
+    private val state: AppState get() = AppGraph.get(application)
     private val askNotify = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {

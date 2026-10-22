@@ -20,6 +20,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".BubbleActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:allowEmbedded="true"
+            android:documentLaunchMode="always"
+            android:taskAffinity=""
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.PiAgent"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode" />
         <service android:name=".RunService" android:exported="false" android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
