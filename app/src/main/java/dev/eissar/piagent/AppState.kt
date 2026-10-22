@@ -118,6 +118,9 @@ class AppState(val app: Application) {
     /** Bumped when the bubble preference changes, so Compose re-reads it. */
     var bubbleVersion by mutableStateOf(0); private set
 
+    /** Open the system channel settings where bubbles can be allowed for Pi. */
+    fun openBubbleSettings() = Notifier.openBubbleSettings(app)
+
     /** Whether watched chats are shown as bubbles (user preference). */
     fun bubblesForWatched(): Boolean { bubbleVersion; return watcher.bubblesOn() }
 
@@ -125,8 +128,8 @@ class AppState(val app: Application) {
     fun setBubblesForWatched(on: Boolean) {
         watcher.setBubbles(on)
         bubbleVersion++
-        if (on && !Notifier.bubblesEnabled(app))
-            say("Enable bubbles for Pi in system settings to see them")
+        if (on && !Notifier.notificationsEnabled(app))
+            say("Notifications are off for Pi — enable them in system settings")
     }
 
     /** True when this session has a live bubble notification. */
@@ -139,8 +142,6 @@ class AppState(val app: Application) {
         if (Notifier.isBubbled(app, sid)) Notifier.unbubble(app, sid)
         else {
             Notifier.bubble(app, sid, c.title, lastAssistantText(c).ifBlank { c.status }, ping = false)
-            if (!Notifier.bubblesEnabled(app))
-                say("Bubble posted — enable bubbles for Pi in system settings if it doesn't appear")
         }
     }
 
@@ -508,7 +509,7 @@ class AppState(val app: Application) {
         when (ev.str("type")) {
             "extension_ui_request" -> onExtensionUi(ev)
             "extension_error" -> say(ev.str("error"))
-            "agent_start" -> { c.busy = true; c.status = "Thinking…" }
+            "agent_start" -> { c.busy = true; c.status = "Thinking…"; refreshBubble(c) }
             "message_start", "message_update" -> {
                 val m = ev.obj("message") ?: return
                 if (m.str("role") != "assistant") return

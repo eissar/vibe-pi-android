@@ -165,6 +165,9 @@ private fun ServerScreen(s: AppState, done: () -> Unit) {
                 }
                 Switch(checked = s.bubblesForWatched(), onCheckedChange = s::setBubblesForWatched)
             }
+            OutlinedButton({ s.openBubbleSettings() }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Allow bubbles in system settings", fontSize = 13.sp)
+            }
             Muted("Run the server with PI_WEBUI_HOST=0.0.0.0 npm start", lines = 3)
         }
     }

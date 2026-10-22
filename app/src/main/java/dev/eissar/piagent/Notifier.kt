@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.provider.Settings
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -47,7 +48,11 @@ object Notifier {
         )
         nm.createNotificationChannel(
             NotificationChannel(CH_BUBBLE, "Chats", NotificationManager.IMPORTANCE_HIGH)
-                .apply { description = "Chat notifications that can be shown as bubbles"; setShowBadge(true) }
+                .apply {
+                    description = "Chat notifications that can be shown as bubbles"
+                    setShowBadge(true)
+                    if (Build.VERSION.SDK_INT >= 30) setAllowBubbles(true)
+                }
         )
         nm.createNotificationChannel(
             NotificationChannel(CH_WORKING, "Agent working", NotificationManager.IMPORTANCE_MIN)
@@ -138,7 +143,7 @@ object Notifier {
      * Long-lived so it survives reboots, matching the persistent watch notification.
      */
     private fun publishShortcut(ctx: Context, sid: String, title: String) {
-        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setImportant(true).build()
+        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setKey(sid).setImportant(true).build()
         val info = ShortcutInfoCompat.Builder(ctx, shortcutId(sid))
             .setShortLabel(title.ifBlank { "Pi" })
             .setLongLabel(title.ifBlank { "Pi" })
@@ -162,7 +167,7 @@ object Notifier {
             .setAutoExpandBubble(false)
             .setSuppressNotification(false)
             .build()
-        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setImportant(true).build()
+        val person = Person.Builder().setName(title.ifBlank { "Pi" }).setKey(sid).setImportant(true).build()
         val n = NotificationCompat.Builder(ctx, CH_BUBBLE)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle(title.ifBlank { "Pi" })
@@ -189,9 +194,30 @@ object Notifier {
         runCatching { ShortcutManagerCompat.removeDynamicShortcuts(ctx, listOf(shortcutId(sid))) }
     }
 
-    /** False when the user turned bubbles off for the app in system settings. */
-    fun bubblesEnabled(ctx: Context): Boolean =
-        ctx.getSystemService(NotificationManager::class.java).areBubblesAllowed()
+    /**
+     * Whether notifications can be posted at all. (There is no reliable API for the
+     * per-app bubble switch — areBubblesAllowed() is deprecated and returns stale values
+     * on Android 12+ — so bubbles are always posted and simply shown as plain
+     * notifications when the user has them off.)
+     */
+    fun notificationsEnabled(ctx: Context): Boolean =
+        NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+
+    /** Opens this app's "Chats" channel settings, where the user can allow bubbles. */
+    fun openBubbleSettings(ctx: Context) {
+        val i = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, CH_BUBBLE)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(i) }
+            .recoverCatching {
+                ctx.startActivity(
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+    }
 
     fun isBubbled(ctx: Context, sid: String): Boolean =
         NotificationManagerCompat.from(ctx).activeNotifications.any { it.id == bubbleId(sid) }

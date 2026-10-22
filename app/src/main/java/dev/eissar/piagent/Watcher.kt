@@ -141,10 +141,10 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
     }
 
     /** User preference (system setting permitting): watched chats show as bubbles. */
-    private var bubbles = prefs.getBoolean("bubbleWatched", true) && Notifier.bubblesEnabled(ctx)
+    private var bubbles = prefs.getBoolean("bubbleWatched", true)
 
     fun setBubbles(on: Boolean) {
-        bubbles = on && Notifier.bubblesEnabled(ctx)
+        bubbles = on
         prefs.edit().putBoolean("bubbleWatched", on).apply()
         entries.values.forEach { e ->
             if (bubbles) post(e, ping = false) else Notifier.unbubble(ctx, e.sid)
