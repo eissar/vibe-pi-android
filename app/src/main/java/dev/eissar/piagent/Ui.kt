@@ -135,8 +135,20 @@ private fun OfflineBar(s: AppState) {
 
 @Composable
 private fun ServerScreen(s: AppState, done: () -> Unit) {
-    LaunchedEffect(s.conn) { if (s.conn == Conn.Online) done() }
-    Scaffold(topBar = { TopAppBar(title = { Text("Server") }) }) { pad ->
+    // Close only when a connection attempt *succeeds* while this screen is open; opening the
+    // screen while already online must stay put (otherwise it flashes and disappears).
+    var wasOnline by remember { mutableStateOf(s.conn == Conn.Online) }
+    LaunchedEffect(s.conn) {
+        val online = s.conn == Conn.Online
+        if (online && !wasOnline) done()
+        wasOnline = online
+    }
+    Scaffold(topBar = {
+        TopAppBar(
+            title = { Text("Server") },
+            navigationIcon = { IconButton(done) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+        )
+    }) { pad ->
         Column(Modifier.padding(pad).padding(20.dp).imePadding(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedTextField(
                 s.address, { s.address = it }, Modifier.fillMaxWidth(), singleLine = true,
