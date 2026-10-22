@@ -7,3 +7,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "pi-agent"
 include(":app")
+
+plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version("0.8.0")
+}

@@ -12,3 +12,17 @@ local.properties
 app/build/
 .idea/
 *.iml
+
+# embedded Bark ASR weights (download from HF / regenerate via bark-android/port)
+app/src/main/assets/models/bark/
+
+# Bark port intermediates (weights/models: regenerate via bark-android/port, or fetch from the model server)
+bark-android/port/model.bark
+bark-android/port/bark-hf/
+bark-android/port/onnx/
+bark-android/port/*.wav
+bark-android/port/.venv/
+bark-android/port/tokenizer_*.model
+bark-android/port/tokens_v3.txt
+bark-android/port/config.json
+__pycache__/
