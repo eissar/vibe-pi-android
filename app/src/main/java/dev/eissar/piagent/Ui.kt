@@ -22,21 +22,16 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.*
-import android.Manifest
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -45,7 +40,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -316,7 +310,6 @@ private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
         Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 8.dp, vertical = 6.dp)) {
             MetricsBar(s, c, pickModel)
             Row(verticalAlignment = Alignment.Bottom) {
-                DictateButton(c)
                 OutlinedTextField(
                     c.draft, { c.draft = it }, Modifier.weight(1f), maxLines = 8,
                     placeholder = { Text(if (c.busy) "Steer now / queue follow-up…" else "Message Pi…") },
@@ -338,54 +331,6 @@ private fun Composer(s: AppState, c: AppState.Chat, pickModel: () -> Unit) {
                 }
             }
         }
-    }
-}
-
-/**
- * Mic button for on-device Bark dictation. Tap to start, tap again to stop;
- * the transcript is appended to the draft. Press-and-hold behavior omitted
- * (toggle matches the app's other controls).
- */
-@Composable
-private fun DictateButton(c: AppState.Chat) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var recording by remember { mutableStateOf(false) }
-    var transcribing by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    fun append(text: String) {
-        c.draft = if (c.draft.isBlank()) text else c.draft.trimEnd() + " " + text
-    }
-
-    val recorder = remember { DictationRecorder(ctx,
-        onResult = { text -> append(text); transcribing = false },
-        onError = { error = it?.message ?: "dictation failed"; transcribing = false },
-    ) }
-
-    val permLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) { recording = true; recorder.start() } else error = "microphone permission denied" }
-
-    fun toggle() {
-        error = null
-        when {
-            recording -> { recording = false; transcribing = true; scope.launch(Dispatchers.Default) { recorder.stop() } }
-            transcribing -> {}
-            else -> permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    IconButton(::toggle, enabled = !transcribing) {
-        when {
-            transcribing -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-            recording -> Icon(Icons.Filled.Mic, "Stop dictation", tint = MaterialTheme.colorScheme.error)
-            else -> Icon(Icons.Filled.Mic, "Dictate")
-        }
-    }
-    error?.let {
-        // show inline via draft placeholder is intrusive; surface as a snackbar-less text next to button
-        // (kept minimal: errors reset on next tap)
     }
 }
 

@@ -51,12 +51,10 @@ android {
 }
 
 dependencies {
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
     implementation(libs.compose.icons)
-    implementation(libs.compose.icons.ext)
     implementation(libs.activity.compose)
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
@@ -65,5 +63,4 @@ dependencies {
     implementation(libs.serialization.json)
     implementation(libs.coroutines.android)
     implementation(libs.lifecycle.runtime.compose)
-    testImplementation("junit:junit:4.13.2")
 }
