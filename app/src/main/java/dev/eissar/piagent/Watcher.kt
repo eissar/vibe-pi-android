@@ -20,7 +20,6 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
     private class Entry(val sid: String, var title: String) {
         var state = WatchState.Idle
         var detail = ""
-        var pinged = WatchState.Idle     // last state the user was pinged about
         var pingJob: Job? = null
         var unsubscribe: (() -> Unit)? = null
     }
@@ -44,7 +43,6 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
         val e = entries.getOrPut(sid) { Entry(sid, title) }
         e.title = title
         e.state = if (running) WatchState.Working else WatchState.Idle
-        e.pinged = e.state
         save()
         post(e, ping = false)
     }
@@ -117,20 +115,20 @@ class Watcher(private val ctx: Context, private val scope: CoroutineScope) {
         m.objs("content").filter { it.str("type") == "text" }.joinToString("\n") { it.str("text") }.trim().takeIf { it.isNotEmpty() }?.take(300)
 
     private fun update(e: Entry, state: WatchState, detail: String) {
-        val changed = state != e.state
+        val previous = e.state
         e.state = state
         e.detail = detail
-        post(e, ping = false) // live text, silent
-        if (!changed) return
-        // Debounce: ping only once the state has held for PING_DEBOUNCE_MS, and only if it differs
-        // from what the user was last pinged about (so Working→Idle→Working within 5 s stays quiet).
+        post(e, ping = false) // live text, always silent
+        if (state == previous) return
+        // Only a completed agent turn is allowed to make a sound: the transition back to Idle
+        // after the chat was actually working. Errors, waiting-for-input and the start of work
+        // update the notification silently.
+        if (state != WatchState.Idle || previous != WatchState.Working) return
+        // Debounce so a turn that immediately queues another one doesn't chirp twice.
         e.pingJob?.cancel()
         e.pingJob = scope.launch {
             delay(PING_DEBOUNCE_MS)
-            if (e.state != e.pinged) {
-                e.pinged = e.state
-                post(e, ping = true)
-            }
+            if (e.state == WatchState.Idle) post(e, ping = true)
         }
     }
 
